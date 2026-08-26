@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#080b12"/>
+      <stop offset="50%" stop-color="#101827"/>
+      <stop offset="100%" stop-color="#05120d"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#22c55e"/>
+      <stop offset="50%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#a78bfa"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <circle cx="1320" cy="160" r="320" fill="#22c55e" opacity="0.08"/>
+  <circle cx="220" cy="780" r="360" fill="#38bdf8" opacity="0.08"/>
+  <rect x="80" y="80" width="1440" height="740" rx="44" fill="#0b1020" stroke="#233044" stroke-width="3"/>
+  <text x="120" y="165" font-family="Inter, Arial, sans-serif" font-size="42" fill="#94a3b8" letter-spacing="6">ONE NVIDIA DGX SPARK</text>
+  <text x="120" y="280" font-family="Inter, Arial, sans-serif" font-size="82" font-weight="800" fill="#ffffff">Qwen3.8 Flash‑Next GGUF</text>
+  <text x="120" y="360" font-family="Inter, Arial, sans-serif" font-size="48" fill="#dbeafe">177B params • 6B active • 262K native context</text>
+  <rect x="120" y="430" width="410" height="150" rx="28" fill="#101827" stroke="#334155"/>
+  <text x="155" y="490" font-family="Inter, Arial, sans-serif" font-size="28" fill="#94a3b8">Single stream</text>
+  <text x="155" y="555" font-family="Inter, Arial, sans-serif" font-size="66" font-weight="800" fill="#22c55e">30 tok/s</text>
+  <rect x="595" y="430" width="410" height="150" rx="28" fill="#101827" stroke="#334155"/>
+  <text x="630" y="490" font-family="Inter, Arial, sans-serif" font-size="28" fill="#94a3b8">2 users</text>
+  <text x="630" y="555" font-family="Inter, Arial, sans-serif" font-size="66" font-weight="800" fill="#38bdf8">52 tok/s</text>
+  <rect x="1070" y="430" width="410" height="150" rx="28" fill="#101827" stroke="#334155"/>
+  <text x="1105" y="490" font-family="Inter, Arial, sans-serif" font-size="28" fill="#94a3b8">Model size</text>
+  <text x="1105" y="555" font-family="Inter, Arial, sans-serif" font-size="66" font-weight="800" fill="#a78bfa">~82 GB</text>
+  <rect x="120" y="640" width="1360" height="4" fill="url(#accent)"/>
+  <text x="120" y="715" font-family="Inter, Arial, sans-serif" font-size="36" fill="#e5e7eb">Working path: llama.cpp qwen4exp branch • reasoning off • OpenAI-compatible API</text>
+  <text x="120" y="770" font-family="Inter, Arial, sans-serif" font-size="30" fill="#94a3b8">The future architecture runs on one Spark — not yet the fastest daily driver, but very real.</text>
+</svg>
