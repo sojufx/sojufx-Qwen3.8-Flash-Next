@@ -54,7 +54,7 @@ The first launch creates the packed PLE table and tunes kernels. Allow roughly 1
 Smoke test it locally:
 
 ```bash
-/opt/sojufx-Qwen3.8-Flash-Next/scripts/smoke-vllm.sh
+BASE_URL=http://127.0.0.1:8001 /opt/sojufx-Qwen3.8-Flash-Next/scripts/smoke-vllm.sh
 ```
 
 ## Build The 65K Draft Vocabulary
@@ -87,6 +87,7 @@ For a functional baseline without this optimisation, comment out `MTP_DRAFT_VOCA
 - `MAX_NUM_SEQS=8` plus `CUDAGRAPH_CAPTURE_SIZES=auto` ensures every MTP verify width is captured for short concurrent requests.
 - `MAX_NUM_BATCHED_TOKENS=2048` balances prefill throughput with responsiveness for existing streams.
 - Leave `HOST_RESERVE_GIB=26` in place unless you have independently re-measured unified-memory safety.
+- Always bind the active production model to local port `8001`. The public gateway remains `https://ai.sojufx.com/v1`; clients and API keys do not change when models change.
 - For interactive agent and tool clients, set `chat_template_kwargs: {"enable_thinking": false}` to prevent hidden reasoning from consuming the response budget.
 
 ## Attribution
