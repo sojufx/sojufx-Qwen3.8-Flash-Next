@@ -88,7 +88,23 @@ For a functional baseline without this optimisation, comment out `MTP_DRAFT_VOCA
 - `MAX_NUM_BATCHED_TOKENS=2048` balances prefill throughput with responsiveness for existing streams.
 - Leave `HOST_RESERVE_GIB=26` in place unless you have independently re-measured unified-memory safety.
 - Always bind the active production model to local port `8001`. The public gateway remains `https://ai.sojufx.com/v1`; clients and API keys do not change when models change.
-- For interactive agent and tool clients, set `chat_template_kwargs: {"enable_thinking": false}` to prevent hidden reasoning from consuming the response budget.
+- Keep a stable external model alias at the gateway. Our clients continue to request `ornith`, while the gateway rewrites that alias to the currently served vLLM model. This avoids touching Hermes, OpenCode, or other client configuration during a model swap.
+- Thinking is disabled by default at the gateway for this production profile, preventing hidden reasoning from consuming an interactive response budget. A client can explicitly opt in per request with `chat_template_kwargs: {"enable_thinking": true}`.
+
+### Stable Gateway Alias
+
+The served model name is intentionally an internal vLLM detail. Keep the public
+API base URL and the client-facing model alias stable, then make the gateway
+rewrite that alias to the active server model. For example, the active target
+can live in a user-owned runtime file:
+
+```bash
+mkdir -p ~/.config/vllm
+printf '%s\n' qwen3.8-flash-next > ~/.config/vllm/upstream-model-alias
+```
+
+On a later model swap, update that file to the new internal served-model name.
+Clients continue to use the same endpoint, key, and external model alias.
 
 ## Attribution
 
