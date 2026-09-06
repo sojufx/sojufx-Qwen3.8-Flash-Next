@@ -1,180 +1,100 @@
-# Qwen3.8 Flash-Next GGUF on one DGX Spark
+# Qwen3.8 Flash-Next NVFP4 on One DGX Spark
 
-![Qwen3.8 Flash-Next GGUF on DGX Spark](assets/banner.svg)
+A production-minded vLLM recipe for `Mia-AiLab/Qwen3.8-Flash-Next-NVFP4` on a single NVIDIA DGX Spark / GB10.
 
-Native llama.cpp recipe for running `unsloth/Qwen3.8-Flash-Next-GGUF` on a single NVIDIA DGX Spark / GB10.
+This supersedes this repository's earlier GGUF / llama.cpp experiment. The deployed configuration uses the NVFP4 checkpoint, PLE offload, FP8 KV cache, native MTP speculative decoding, and vLLM's Qwen3.8 Flash-Next image. It retains the model's native 262,144-token context and exposes an OpenAI-compatible API for text, vision, tools, and agent clients.
 
-This is a field-tested setup, not a theoretical one. The model loads on one Spark, exposes an OpenAI-compatible endpoint, and works with agent clients when thinking mode is disabled.
+## Production Profile
 
-## Why this repo exists
-
-`Qwen3.8-Flash-Next` is not a normal Qwen checkpoint. It uses the new `qwen4exp` architecture, with hybrid attention, Qwen Sparse Attention, Gated DeltaNet, n-gram embeddings, MoE, vision support, and a native 262,144-token context window.
-
-At the time of this recipe, stock llama.cpp did not load the GGUF for us:
-
-```text
-unknown model architecture: 'qwen4exp'
-```
-
-The working path was the llama.cpp Qwen4 experimental PR branch, then a conservative serve profile tuned for DGX Spark unified memory.
-
-## Tested hardware
-
-| Component | Value |
+| Component | Setting |
 |---|---|
-| Machine | NVIDIA DGX Spark / GB10 |
-| Memory | 128 GB unified memory |
-| Storage | 1 TB NVMe |
-| Runtime | llama.cpp custom `qwen4exp` branch |
-| Model | `unsloth/Qwen3.8-Flash-Next-GGUF` |
-| Quant tested | `UD-IQ3_XXS` |
-| GGUF size | ~82 GB |
-| Architecture shown by runtime | `qwen4exp` |
-| Native context | 262,144 tokens |
+| Runtime | `vllm/vllm-openai:qwen38-flash-next` |
+| Context | Native 262,144 tokens, YaRN off |
+| Speculative decoding | Native MTP, K=3 |
+| MTP draft vocabulary | 65,536 corpus-built tokens |
+| KV cache | FP8 |
+| Recurrent state | BF16 |
+| Scheduler | 8 sequences |
+| Decode CUDA graphs | Every MTP verify width (`auto`) |
+| Prefill chunk | 2,048 tokens |
 
-## What worked for production testing
+The 65K draft vocabulary makes each MTP draft step much lighter. The target model still verifies every drafted token, so it trades acceptance for bandwidth rather than changing the final generated-token distribution.
 
-This was the stable interactive profile:
+## Measured Results
 
-```bash
-/home/sojufx/llama.cpp/build-qwen4exp/bin/llama-server \
-  -m /opt/huggingface/models/Qwen3.8-Flash-Next-GGUF-UD-IQ3_XXS/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --alias ornith \
-  --api-key YOUR_API_KEY \
-  --ctx-size 131072 \
-  --parallel 2 \
-  --cont-batching \
-  --cache-prompt \
-  --batch-size 1024 \
-  --ubatch-size 256 \
-  --reasoning off
-```
+One DGX Spark / GB10, warm server. Our fixed production suite used four prompts, 256 output tokens, two runs, `temperature=0`, and thinking disabled. Numbers are medians and should not be compared directly with a different prompt, runtime, or hardware.
 
-Important llama.cpp detail:
+| Prompt class | C1 | C4 aggregate |
+|---|---:|---:|
+| Agent / tool JSON | 37.7 tok/s | 104.9 tok/s |
+| Code edit | 38.2 tok/s | 97.1 tok/s |
+| Generic coding | 35.7 tok/s | 96.1 tok/s |
+| Long-context review | 45.0 tok/s | 104.5 tok/s |
 
-```text
-ctx-size is split across slots.
---ctx-size 131072 --parallel 2 = 2 slots × 65536 tokens each.
-```
+After startup the server had 1,120,336 KV tokens available: approximately 4.27 requests at the full 262K context. `MAX_NUM_SEQS=8` improves short-context concurrency; it does not make eight 262K requests fit simultaneously.
 
-For one very deep context session, this also loaded:
+## Quick Start
+
+This repo layers a validated configuration over the maintained upstream launcher. It does not redistribute its patched PLE-offload implementation.
 
 ```bash
---ctx-size 262144 --parallel 1
+git clone https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark.git \
+  /opt/Qwen3.8-Flash-Next-Single-DGX-Spark
+git clone https://github.com/sojufx/sojufx-Qwen3.8-Flash-Next.git \
+  /opt/sojufx-Qwen3.8-Flash-Next
+
+cd /opt/Qwen3.8-Flash-Next-Single-DGX-Spark
+cp /opt/sojufx-Qwen3.8-Flash-Next/.env.production .env
+./download.sh
+./start.sh
 ```
 
-That gives one full 262K slot. It is not the best multi-user production profile.
+The first launch creates the packed PLE table and tunes kernels. Allow roughly 130 GB of free SSD space and 10-12 minutes before `/health` is ready. Do not run another large GPU model at the same time.
 
-## Benchmark snapshot
-
-Benchmark prompt: local OpenAI-compatible streaming code-generation test.
-
-| Load | Result |
-|---|---:|
-| C1 | 30.2 tok/s |
-| C2 | 52.4 tok/s aggregate, ~26 tok/s per stream |
-| C4 | 52.6 tok/s aggregate, queued because only 2 slots |
-| TTFT C1 | ~0.6 s |
-| RAM after load | ~85–93 GiB observed |
-
-This is not faster than our best vLLM NVFP4 recipes, but it is interesting because it gets a huge 177B-param / 6B-active class model running locally on one Spark.
-
-## The big gotcha: thinking mode
-
-Qwen3.8 Flash-Next thinks by default. On llama.cpp, our first normal API request returned only `reasoning_content` and hit `finish_reason="length"` with empty final `content`.
-
-For agent clients and OpenAI-compatible tools, use:
+Smoke test it locally:
 
 ```bash
---reasoning off
+/opt/sojufx-Qwen3.8-Flash-Next/scripts/smoke-vllm.sh
 ```
 
-or send request-level:
+## Build The 65K Draft Vocabulary
 
-```json
-{
-  "reasoning_effort": "none"
-}
+The production profile expects:
+
+```text
+~/.cache/vllm/draft_vocab/qwen38fn_en_code_65k.txt
 ```
 
-Without this, clients like Hermes/OpenCode may look stuck because the model spends its entire output budget inside hidden reasoning.
-
-Recommended non-thinking sampling from the upstream model card:
-
-```json
-{
-  "temperature": 0.7,
-  "top_p": 0.8,
-  "top_k": 20,
-  "presence_penalty": 1.5
-}
-```
-
-## Build llama.cpp with Qwen4 experimental support
+Build it from representative English and code text. Use a corpus resembling your real workload rather than a random file.
 
 ```bash
-git clone https://github.com/ggerganov/llama.cpp.git
-cd llama.cpp
-
-# Use a branch/PR that contains qwen4exp support.
-# The exact branch name may change; this repo records the tested build in notes below.
-git fetch origin pull/27742/head:qwen4exp-pr-27742
-git checkout qwen4exp-pr-27742
-
-cmake -B build-qwen4exp -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121a
-cmake --build build-qwen4exp -j --target llama-server llama-cli
+cd /opt/Qwen3.8-Flash-Next-Single-DGX-Spark
+mkdir -p ~/.cache/vllm/draft_vocab
+python3 files/build_draft_vocab.py \
+  /data/corpus/english-and-code.txt \
+  --model Mia-AiLab/Qwen3.8-Flash-Next-NVFP4 \
+  --size 65536 \
+  --out ~/.cache/vllm/draft_vocab/qwen38fn_en_code_65k.txt
 ```
 
-Tested runtime printed:
+For a functional baseline without this optimisation, comment out `MTP_DRAFT_VOCAB` in `.env`.
 
-```text
-llama.cpp build 10656, commit 035e22731
-```
+## Operational Notes
 
-## Download the model
+- Keep `YARN=0` for native 262K context. Treat longer YaRN serving as a separate experiment.
+- FP8 KV enables several deep sessions, but validate retrieval quality against your own workload.
+- MTP K=3 was the best fixed depth we measured. Higher depth is not automatically faster.
+- `MAX_NUM_SEQS=8` plus `CUDAGRAPH_CAPTURE_SIZES=auto` ensures every MTP verify width is captured for short concurrent requests.
+- `MAX_NUM_BATCHED_TOKENS=2048` balances prefill throughput with responsiveness for existing streams.
+- Leave `HOST_RESERVE_GIB=26` in place unless you have independently re-measured unified-memory safety.
+- For interactive agent and tool clients, set `chat_template_kwargs: {"enable_thinking": false}` to prevent hidden reasoning from consuming the response budget.
 
-```bash
-huggingface-cli download unsloth/Qwen3.8-Flash-Next-GGUF \
-  --include "UD-IQ3_XXS/*" \
-  --local-dir /opt/huggingface/models/Qwen3.8-Flash-Next-GGUF-UD-IQ3_XXS
-```
+## Attribution
 
-The first shard is the entrypoint file:
+The vLLM image, PLE-offload implementation, and upstream launcher are maintained by [MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark). This repository records the production configuration and benchmark method validated on our one-Spark system.
 
-```text
-UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf
-```
-
-## Why not vLLM yet?
-
-The Hugging Face page includes generic vLLM instructions, but for this GGUF we found the practical path today is llama.cpp with `qwen4exp` support. vLLM may become the right route later, especially when qwen4exp support lands cleanly and batching/speculative decode mature for this architecture.
-
-## Current recommendation
-
-For experimenting:
-
-```text
-Flash-Next GGUF is worth trying.
-```
-
-For production speed with multiple users on one Spark:
-
-```text
-Use a mature vLLM NVFP4 model such as Qwen3.6 35B-A3B, Laguna S 2.1, or Nemotron 3.5 Lightning.
-```
-
-This model is the “future is leaking through the wall” setup. It runs, it is fascinating, but it is not yet the fastest daily-driver recipe on one Spark.
-
-## Sources
-
-- Model card: https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF
-- Qwen3.8 Flash-Next blog/technical report links are referenced from the model card.
-- llama.cpp: https://github.com/ggerganov/llama.cpp
+Model weights: [Mia-AiLab/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/Mia-AiLab/Qwen3.8-Flash-Next-NVFP4).
 
 ## License
 
-Recipe code and docs in this repo are Apache-2.0.
-
-The model weights are governed by the upstream model license on Hugging Face.
+Recipe documentation and helper scripts are Apache-2.0. The model, vLLM image, and upstream launcher retain their own licenses.

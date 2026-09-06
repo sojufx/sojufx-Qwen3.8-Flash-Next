@@ -1,41 +1,29 @@
-# Benchmark results
+# Benchmark Notes
 
-These are quick production-style numbers from one NVIDIA DGX Spark using the `UD-IQ3_XXS` GGUF quant and llama.cpp `qwen4exp` support.
-
-## Serve profile
+## Profile
 
 ```text
-ctx-size: 131072
-parallel: 2
-effective slots: 2 × 65536 tokens
-reasoning: off
-continuous batching: on
-prompt cache: on
-batch-size: 1024
-ubatch-size: 256
+Native context: 262,144 tokens
+MTP: K=3
+Draft vocabulary: 65,536 tokens
+KV cache: FP8
+Recurrent state: BF16
+Max sequences: 8
+CUDA graph capture: auto
+Prefill chunk: 2,048 tokens
 ```
 
-## Results
+## Fixed Prompt Suite
 
-| Concurrency | Successful | Wall time | Aggregate tok/s | Per-stream tok/s | TTFT |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 1/1 | 9.53s | 30.2 | 30.2 | 0.615s |
-| 2 | 2/2 | 11.49s | 52.4 | ~26.3 median | ~0.540s median |
-| 4 | 4/4 | 22.53s | 52.6 | ~19.8 median | ~5.96s median |
+One DGX Spark / GB10, warm vLLM server. Four prompts at C1 and C4, two repetitions, `max_tokens=256`, `temperature=0`, and thinking disabled. Values are median aggregate completion throughput.
 
-The C4 result queues because the production profile only has two slots. Use this as a signal that the model works, not as a claim that this is the best four-user Spark model today.
+| Prompt | C1 | C4 |
+|---|---:|---:|
+| Agent / tool JSON | 37.7 tok/s | 104.9 tok/s |
+| Code edit | 38.2 tok/s | 97.1 tok/s |
+| Generic coding | 35.7 tok/s | 96.1 tok/s |
+| Long-context review | 45.0 tok/s | 104.5 tok/s |
 
-## Server-side timing from a short sanity request
+The new profile improved tool and long-review workloads relative to the prior full-draft-vocabulary deployment. The short generic request was slightly slower, so this is a production trade-off, not a universal speed claim.
 
-```text
-prompt_per_second: ~40.5 tok/s
-predicted_per_second: ~27.2 tok/s
-```
-
-## Practical interpretation
-
-- Good: one Spark can load and serve a huge Qwen3.8 Flash-Next GGUF.
-- Good: 262K single-slot context works.
-- Good: 128K total / two 65K slots is usable for two agent sessions.
-- Bad: llama.cpp path is slower than mature vLLM NVFP4 + speculative decoding recipes.
-- Bad: default thinking mode can burn the whole output budget unless disabled.
+The server reported 1,120,336 KV tokens after startup, or about 4.27 full 262K-context requests.
