@@ -11,14 +11,14 @@ This supersedes this repository's earlier GGUF / llama.cpp experiment. The deplo
 | Runtime | `vllm/vllm-openai:qwen38-flash-next` |
 | Context | Native 262,144 tokens, YaRN off |
 | Speculative decoding | Native MTP, K=3 |
-| MTP draft vocabulary | 65,536 corpus-built tokens |
+| MTP draft vocabulary | 47,149 code-tuned tokens |
 | KV cache | FP8 |
 | Recurrent state | BF16 |
 | Scheduler | 8 sequences |
 | Decode CUDA graphs | Every MTP verify width (`auto`) |
 | Prefill chunk | 2,048 tokens |
 
-The 65K draft vocabulary makes each MTP draft step much lighter. The target model still verifies every drafted token, so it trades acceptance for bandwidth rather than changing the final generated-token distribution.
+The upstream 47K draft vocabulary makes each MTP draft step much lighter. The target model still verifies every drafted token, so it trades acceptance for bandwidth rather than changing the final generated-token distribution.
 
 ## Measured Results
 
@@ -26,12 +26,12 @@ One DGX Spark / GB10, warm server. Our fixed production suite used four prompts,
 
 | Prompt class | C1 | C4 aggregate |
 |---|---:|---:|
-| Agent / tool JSON | 37.7 tok/s | 104.9 tok/s |
-| Code edit | 38.2 tok/s | 97.1 tok/s |
-| Generic coding | 35.7 tok/s | 96.1 tok/s |
-| Long-context review | 45.0 tok/s | 104.5 tok/s |
+| Agent / tool JSON | 37.1 tok/s | 94.4 tok/s |
+| Code edit | 42.8 tok/s | 108.4 tok/s |
+| Generic coding | 46.9 tok/s | 132.3 tok/s |
+| Long-context review | 37.8 tok/s | 95.6 tok/s |
 
-After startup the server had 1,120,336 KV tokens available: approximately 4.27 requests at the full 262K context. `MAX_NUM_SEQS=8` improves short-context concurrency; it does not make eight 262K requests fit simultaneously.
+This launch reported 1,066,149 KV tokens available: approximately 4.07 requests at the full 262K context. KV capacity varies slightly by launch. `MAX_NUM_SEQS=8` improves short-context concurrency; it does not make eight 262K requests fit simultaneously.
 
 ## Quick Start
 
@@ -57,27 +57,23 @@ Smoke test it locally:
 BASE_URL=http://127.0.0.1:8001 /opt/sojufx-Qwen3.8-Flash-Next/scripts/smoke-vllm.sh
 ```
 
-## Build The 65K Draft Vocabulary
+## Use The Shipped 47K Draft Vocabulary
 
-The production profile expects:
+The production profile uses the vocabulary shipped by the upstream Mia recipe:
 
 ```text
-~/.cache/vllm/draft_vocab/qwen38fn_en_code_65k.txt
+files/draft_vocab_en_code_47k.txt
 ```
 
-Build it from representative English and code text. Use a corpus resembling your real workload rather than a random file.
+It reduces the MTP draft head from 1.18 GiB to 0.22 GiB per draft step. On the benchmarked one-Spark profile, it improved our C1 and C4 results across the fixed agent, code, generic, and long-review suite.
 
 ```bash
 cd /opt/Qwen3.8-Flash-Next-Single-DGX-Spark
-mkdir -p ~/.cache/vllm/draft_vocab
-python3 files/build_draft_vocab.py \
-  /data/corpus/english-and-code.txt \
-  --model Mia-AiLab/Qwen3.8-Flash-Next-NVFP4 \
-  --size 65536 \
-  --out ~/.cache/vllm/draft_vocab/qwen38fn_en_code_65k.txt
+grep '^MTP_DRAFT_VOCAB' .env
+# MTP_DRAFT_VOCAB="files/draft_vocab_en_code_47k.txt"
 ```
 
-For a functional baseline without this optimisation, comment out `MTP_DRAFT_VOCAB` in `.env`.
+For a functional baseline without this optimisation, empty `MTP_DRAFT_VOCAB` in `.env`.
 
 ## Operational Notes
 
