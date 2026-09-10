@@ -13,6 +13,21 @@ CUDA graph capture: auto
 Prefill chunk: 2,048 tokens
 ```
 
+## Structured Decode Bench
+
+Warm single DGX Spark / GB10. Structured streaming count workload, 400 completion
+tokens, `temperature=0`, `top_p=1`, and thinking off. The server was warmed before
+measurement. This is one completed run per concurrency level.
+
+| Concurrency | Per-stream decode | Aggregate decode | TTFT |
+|---:|---:|---:|---:|
+| C1 | 66.17 tok/s | 66.17 tok/s | 447 ms |
+| C2 | 55.37 tok/s | 109.70 tok/s | 280 ms |
+| C4 | 45.16 tok/s | 179.31 tok/s | 318 ms |
+
+The structured stream is a useful reproducibility check, not a substitute for
+agent, code, and long-context evaluation.
+
 ## Fixed Prompt Suite
 
 One DGX Spark / GB10, warm vLLM server. Four prompts at C1 and C4, two repetitions, `max_tokens=256`, `temperature=0`, and thinking disabled. Values are median aggregate completion throughput.
