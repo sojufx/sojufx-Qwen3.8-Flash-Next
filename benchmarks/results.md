@@ -6,6 +6,7 @@
 Native context: 262,144 tokens
 MTP: K=3
 Draft vocabulary: 47,149 code-tuned tokens
+Speculative verifier: TokenV3 cascade, alpha 0.95 for sampled decoding
 KV cache: FP8
 Recurrent state: BF16
 Max sequences: 8
@@ -42,3 +43,16 @@ One DGX Spark / GB10, warm vLLM server. Four prompts at C1 and C4, two repetitio
 The 47K profile improved every cell in this fixed suite versus our preceding 65K draft-vocabulary deployment. Results remain workload-dependent; benchmark representative traffic before claiming a universal speed gain.
 
 The server reported 1,066,149 KV tokens after this startup, or about 4.07 full 262K-context requests. KV capacity varies slightly by launch.
+
+## TokenV3 Sampled Comparison
+
+The TokenV3 path is active only when sampling. This matched A/B used the same warm server profile, four prompt classes, two repetitions, `max_tokens=256`, `temperature=0.6`, and C1/C4 concurrency. Values are median aggregate completion throughput.
+
+| Prompt | Exact C1 | TokenV3 C1 | Exact C4 | TokenV3 C4 |
+|---|---:|---:|---:|---:|
+| Agent / tool JSON | 33.7 | 50.1 | 87.9 | 118.1 |
+| Code edit | 40.5 | 46.6 | 108.2 | 120.8 |
+| Generic coding | 44.0 | 51.2 | 111.7 | 135.0 |
+| Long-context review | 34.6 | 48.3 | 89.9 | 116.1 |
+
+TokenV3 is intentionally lossy: it can accept a sufficiently high-probability draft token instead of requiring exact rejection-sampling equivalence. Treat this table as throughput evidence only. Use exact verification (`VLLM_TOKENV3_ALPHA=0`) when quality equivalence matters, and test tool JSON, coding tasks, and multi-step agent behavior before production adoption.

@@ -1,0 +1,9 @@
+FROM vllm/vllm-openai:qwen38-flash-next
+
+COPY tokenv3_patch.py /tmp/tokenv3_patch.py
+
+RUN set -eux; \
+    target=/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py; \
+    python3 /tmp/tokenv3_patch.py "$target" /tmp/rejection_sampler_utils.py; \
+    mv /tmp/rejection_sampler_utils.py "$target"; \
+    python3 -m py_compile "$target"
