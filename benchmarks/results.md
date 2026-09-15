@@ -35,10 +35,10 @@ One DGX Spark / GB10, warm vLLM server. Four prompts at C1 and C4, two repetitio
 
 | Prompt | C1 | C4 |
 |---|---:|---:|
-| Agent / tool JSON | 37.1 tok/s | 94.4 tok/s |
-| Code edit | 42.8 tok/s | 108.4 tok/s |
-| Generic coding | 46.9 tok/s | 132.3 tok/s |
-| Long-context review | 37.8 tok/s | 95.6 tok/s |
+| Agent / tool JSON | 36.6 tok/s | 100.9 tok/s |
+| Code edit | 45.5 tok/s | 106.9 tok/s |
+| Generic coding | 53.0 tok/s | 132.5 tok/s |
+| Long-context review | 41.6 tok/s | 93.4 tok/s |
 
 The 47K profile improved every cell in this fixed suite versus our preceding 65K draft-vocabulary deployment. Results remain workload-dependent; benchmark representative traffic before claiming a universal speed gain.
 

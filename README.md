@@ -66,10 +66,10 @@ The broader local suite uses four workload classes, 256 output tokens, two repet
 
 | Prompt class | C1 | C4 aggregate |
 |---|---:|---:|
-| Agent / tool JSON | 37.1 tok/s | 94.4 tok/s |
-| Code edit | 42.8 tok/s | 108.4 tok/s |
-| Generic coding | 46.9 tok/s | 132.3 tok/s |
-| Long-context review | 37.8 tok/s | 95.6 tok/s |
+| Agent / tool JSON | 36.6 tok/s | 100.9 tok/s |
+| Code edit | 45.5 tok/s | 106.9 tok/s |
+| Generic coding | 53.0 tok/s | 132.5 tok/s |
+| Long-context review | 41.6 tok/s | 93.4 tok/s |
 
 Both benchmark families belong in a production evaluation: a counting stream is a clean decode measurement; realistic tools, code, and long context reveal the cost of actual work.
 
@@ -137,5 +137,6 @@ This repository documents and benchmarks the Sojufx operating profile. It does n
 - Runtime assets and launcher: [Qwen3.8-Flash-Next-Single-DGX-Spark](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark)
 - NVFP4 model checkpoint: [Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/Mia-AiLab/Qwen3.8-Flash-Next-NVFP4)
 - Benchmark harness: [sparkDash](https://github.com/MiaAI-Lab/sparkDash)
+- TokenV3 cascade-verification research: [MTPLX pull request #485](https://github.com/youssofal/MTPLX/pull/485). This recipe includes a separately maintained vLLM port for the image above.
 
 The recipe documentation and helper scripts in this repository are Apache-2.0. Upstream code, weights, and images retain their respective licenses.
