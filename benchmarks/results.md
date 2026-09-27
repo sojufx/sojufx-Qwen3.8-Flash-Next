@@ -5,11 +5,11 @@
 ```text
 Native context: 262,144 tokens
 MTP: K=3
-Draft vocabulary: 47,149 code-tuned tokens
+Draft vocabulary: 24,576 code-tuned tokens
 Speculative verifier: TokenV3 cascade, alpha 0.95 for sampled decoding
 KV cache: FP8
 Recurrent state: BF16
-Max sequences: 8
+Max sequences: 5
 CUDA graph capture: auto
 Prefill chunk: 2,048 tokens
 ```
@@ -40,7 +40,18 @@ One DGX Spark / GB10, warm vLLM server. Four prompts at C1 and C4, two repetitio
 | Generic coding | 53.0 tok/s | 132.5 tok/s |
 | Long-context review | 41.6 tok/s | 93.4 tok/s |
 
-The 47K profile improved every cell in this fixed suite versus our preceding 65K draft-vocabulary deployment. Results remain workload-dependent; benchmark representative traffic before claiming a universal speed gain.
+## Draft Vocabulary Sweep
+
+The live 47K vocabulary was compared with matched-corpus 47K, 40K, 32K, and 24K candidates. The selected 24K vocabulary was the only candidate that improved both agent/tool and code at both C1 and C4. This table shows the live 47K control and selected 24K candidate; every value is the median of two warm 256-token runs at `temperature=0`.
+
+| Prompt | Live 47K C1 | 24K C1 | Live 47K C4 | 24K C4 |
+|---|---:|---:|---:|---:|
+| Agent / tool JSON | 37.4 | 38.2 | 95.2 | 101.8 |
+| Code edit | 42.4 | 43.0 | 108.5 | 111.8 |
+| Generic coding | 50.6 | 52.3 | 135.1 | 130.6 |
+| Long-context review | 35.6 | 39.2 | 98.8 | 97.5 |
+
+The result is workload-dependent and the sweep has two repetitions per cell. It supports 24K as the default profile, not a universal speed claim.
 
 The server reported 1,066,149 KV tokens after this startup, or about 4.07 full 262K-context requests. KV capacity varies slightly by launch.
 

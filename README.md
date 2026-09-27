@@ -9,18 +9,31 @@ The aim is not a synthetic peak. It is a fast, repeatable local server that keep
 | Component | Setting |
 |---|---|
 | Model | `Mia-AiLab/Qwen3.8-Flash-Next-NVFP4` |
-| Runtime image | `vllm/vllm-openai:qwen38-flash-next` |
+| Runtime image | Qwen3.8 Flash-Next-specific vLLM image with the TokenV3 overlay |
 | Native context | 262,144 tokens (`YaRN=0`) |
 | KV cache | FP8 |
 | Recurrent state | BF16 |
 | Speculative decoding | Native MTP, K=3 |
-| Draft vocabulary | 47,149 code-oriented tokens |
+| Draft vocabulary | 24,576 code-oriented tokens |
 | Speculative verifier | TokenV3 cascade, alpha `0.95` |
-| Scheduler capacity | 8 sequences |
+| Scheduler capacity | 5 sequences |
 | Batched prefill limit | 2,048 tokens |
 | Decode graphs | `auto` |
 
-The 47K draft vocabulary is the important efficiency lever in this configuration. It makes each MTP draft step much lighter while the target model still verifies the proposed tokens. TokenV3 adds a permissive cascade path for sampled decoding: a drafted token may be retained when its target probability is sufficiently close to the target's best token. It is intentionally not bit-for-bit equivalent to exact speculative decoding.
+The 24K draft vocabulary is the selected efficiency lever in this configuration. It makes each MTP draft step lighter while the target model still verifies the proposed tokens. TokenV3 adds a permissive cascade path for sampled decoding: a drafted token may be retained when its target probability is sufficiently close to the target's best token. It is intentionally not bit-for-bit equivalent to exact speculative decoding.
+
+### Draft Vocabulary Selection
+
+The checked-in `files/draft_vocab_en_code_24k.txt` was selected in a warm A/B/C/D sweep on one GB10: live 47K, then matched-corpus 47K, 40K, 32K, and 24K candidates. Each cell is the median of two 256-token runs at `temperature=0`, with TokenV3 enabled but inactive for greedy decoding.
+
+| Prompt class | Live 47K C1/C4 | 24K C1/C4 |
+|---|---:|---:|
+| Agent / tool JSON | 37.4 / 95.2 | 38.2 / 101.8 |
+| Code edit | 42.4 / 108.5 | 43.0 / 111.8 |
+| Generic coding | 50.6 / 135.1 | 52.3 / 130.6 |
+| Long-context review | 35.6 / 98.8 | 39.2 / 97.5 |
+
+24K was the only candidate that improved both agent/tool and code throughput at C1 and C4. The gains are modest, so retain this result as a production-profile choice rather than a universal claim. The exact vocabulary file is included for reproducibility (`SHA256: bdd8985010e7e19968dc5e6f443bfaaa558b01cc13d437397da91de723a7746a`).
 
 ## Build The TokenV3 Image
 
@@ -34,6 +47,8 @@ docker build \
 ```
 
 The patch is opt-in. `VLLM_TOKENV3_ALPHA=0` restores vLLM's exact rejection sampler without rebuilding the image. Do not combine TokenV3 with synthetic or block verification.
+
+> **Runtime compatibility:** do not replace the Qwen3.8 Flash-Next-specific runtime image with stock `vllm/vllm-openai:v0.30.0`. At the time this profile was validated, that stock image did not package the model's required Qwen3.8 Flash-Next source tree, so it fails before model loading. Track a compatible Qwen-specific vLLM 0.30 image before upgrading.
 
 ## Measured Decode Benchmark
 
@@ -120,8 +135,8 @@ It measures post-first-token streaming decode throughput. Warm the server first 
 - Keep `MTP_NUM_SPECULATIVE_TOKENS=3`. Higher K is not inherently faster on GB10.
 - Keep `VLLM_TOKENV3_ALPHA=0.95` only after validating representative sampled workloads. Set it to `0` for exact speculative verification, including A/B quality work.
 - Keep FP8 KV for the balanced production profile. Validate retrieval quality on your own long-context work before changing it.
-- Keep `MAX_NUM_SEQS=8` and `MAX_NUM_BATCHED_TOKENS=2048` for responsive concurrent use.
-- Keep `HOST_RESERVE_GIB=26` unless you have measured unified-memory stability on your own machine.
+- Keep `MAX_NUM_SEQS=5` and `MAX_NUM_BATCHED_TOKENS=2048` for the validated responsive profile.
+- Keep `HOST_RESERVE_GIB=28` unless you have measured unified-memory stability on your own machine.
 - Do not confuse scheduler capacity with full-context concurrency. A launch reporting about 1.07M KV tokens can support roughly four simultaneous 262K-context sessions; the actual number moves slightly with runtime allocation.
 - Bind vLLM to loopback port `8001` and put authentication/TLS in a stable gateway in front of it. The public API URL, keys, and client-facing model alias should survive every model reload.
 - Thinking should be an explicit client decision. This recipe benchmarks with thinking off because hidden reasoning changes both latency and output budget.
@@ -129,6 +144,19 @@ It measures post-first-token streaming decode throughput. Warm the server first 
 ## Public Endpoint Pattern
 
 Keep the runtime model name internal and preserve one stable public alias at the gateway. A client can continue calling `ornith` or another chosen alias while the gateway routes that alias to the current vLLM model. Model experiments then do not require changes in Hermes, Codex, OpenCode, or other clients.
+
+### Gateway Sampling Defaults
+
+The optional gateway can supply Qwen model-card sampling values for clients that omit them. These are request defaults at the proxy, not hard vLLM launch flags. Explicit client values are preserved, except that a requested temperature below `0.3` is raised to `0.3` to avoid unstable low-temperature behaviour.
+
+| Setting | Thinking off | Thinking on |
+|---|---:|---:|
+| `temperature` | `0.7` | `1.0` |
+| `top_p` | `0.8` | `0.95` |
+| `top_k` | `20` | `20` |
+| `presence_penalty` | `1.5` | `0` |
+
+The higher `presence_penalty` in the thinking-off profile is intentional: it reduces repeated tool calls and loop-prone replies when a client has not supplied its own sampling policy. Harnesses that already send their own values retain them, subject only to the `0.3` temperature floor.
 
 ## Required Components And Provenance
 
