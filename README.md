@@ -81,10 +81,10 @@ The broader local suite uses four workload classes, 256 output tokens, two repet
 
 | Prompt class | C1 | C4 aggregate |
 |---|---:|---:|
-| Agent / tool JSON | 36.6 tok/s | 100.9 tok/s |
-| Code edit | 45.5 tok/s | 106.9 tok/s |
-| Generic coding | 53.0 tok/s | 132.5 tok/s |
-| Long-context review | 41.6 tok/s | 93.4 tok/s |
+| Agent / tool JSON | 37.8 tok/s | 102.7 tok/s |
+| Code edit | 42.8 tok/s | 109.3 tok/s |
+| Generic coding | 52.9 tok/s | 123.3 tok/s |
+| Long-context review | 41.6 tok/s | 95.7 tok/s |
 
 Both benchmark families belong in a production evaluation: a counting stream is a clean decode measurement; realistic tools, code, and long context reveal the cost of actual work.
 
