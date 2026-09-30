@@ -2,7 +2,7 @@
 
 This is the Sojufx production recipe for running Qwen3.8 Flash-Next NVFP4 on one NVIDIA DGX Spark / GB10. It is a practical operating profile: native 262K context, FP8 KV cache, BF16 recurrent state, native MTP speculative decoding, stable OpenAI-compatible serving, and a measured multi-user decode profile.
 
-The aim is not a synthetic peak. It is a fast, repeatable local server that keeps the model's native context available for coding, tools, agent workloads, and long sessions. The default profile uses an opt-in TokenV3 cascade verifier to improve sampled speculative decode performance.
+The aim is not a synthetic peak. It is a fast, repeatable local server that keeps the model's native context available for coding, tools, agent workloads, and long sessions. The default profile uses exact speculative verification; permissive TokenV3 cascade verification remains an opt-in experiment.
 
 ## Tested Profile
 
@@ -15,12 +15,12 @@ The aim is not a synthetic peak. It is a fast, repeatable local server that keep
 | Recurrent state | BF16 |
 | Speculative decoding | Native MTP, K=3 |
 | Draft vocabulary | 24,576 code-oriented tokens |
-| Speculative verifier | TokenV3 cascade, alpha `0.95` |
-| Scheduler capacity | 5 sequences |
+| Speculative verifier | TokenV3 exact verification, alpha `0` |
+| Scheduler capacity | 4 sequences |
 | Batched prefill limit | 2,048 tokens |
 | Decode graphs | `auto` |
 
-The 24K draft vocabulary is the selected efficiency lever in this configuration. It makes each MTP draft step lighter while the target model still verifies the proposed tokens. TokenV3 adds a permissive cascade path for sampled decoding: a drafted token may be retained when its target probability is sufficiently close to the target's best token. It is intentionally not bit-for-bit equivalent to exact speculative decoding.
+The 24K draft vocabulary is the selected efficiency lever in this configuration. It makes each MTP draft step lighter while the target model still verifies the proposed tokens. The production profile uses exact speculative verification (`VLLM_TOKENV3_ALPHA=0`); the TokenV3 overlay remains available for separate permissive-verifier experiments.
 
 ### Draft Vocabulary Selection
 
@@ -62,9 +62,9 @@ Warm single DGX Spark / GB10. Structured streaming decode, 400 completion tokens
 
 This is a measured result for this machine and workload, not a universal hardware or model claim. The same prompt, output length, sampling settings, server build, and warm-up state matter.
 
-### TokenV3 Production Suite
+### Permissive TokenV3 Benchmark
 
-Warm single DGX Spark / GB10, native 262K context, 256 completion-token cap, `temperature=0.6`, C1 and C4, two repetitions. These are median aggregate completion throughput results from the live TokenV3 `alpha=0.95` profile.
+Warm single DGX Spark / GB10, native 262K context, 256 completion-token cap, `temperature=0.6`, C1 and C4, two repetitions. These are historical median aggregate completion-throughput results from a permissive TokenV3 `alpha=0.95` experiment, retained for comparison rather than used as the production default.
 
 | Prompt class | C1 | C4 aggregate |
 |---|---:|---:|
@@ -133,9 +133,9 @@ It measures post-first-token streaming decode throughput. Warm the server first 
 
 - Keep `YARN=0`. This preserves the native 262K context; extended-context YaRN belongs in a separate experiment.
 - Keep `MTP_NUM_SPECULATIVE_TOKENS=3`. Higher K is not inherently faster on GB10.
-- Keep `VLLM_TOKENV3_ALPHA=0.95` only after validating representative sampled workloads. Set it to `0` for exact speculative verification, including A/B quality work.
+- Keep `VLLM_TOKENV3_ALPHA=0` for exact speculative verification in production. A positive alpha enables permissive verification and should be treated as an isolated quality experiment.
 - Keep FP8 KV for the balanced production profile. Validate retrieval quality on your own long-context work before changing it.
-- Keep `MAX_NUM_SEQS=5` and `MAX_NUM_BATCHED_TOKENS=2048` for the validated responsive profile.
+- Keep `MAX_NUM_SEQS=4` and `MAX_NUM_BATCHED_TOKENS=2048` for the validated responsive profile.
 - Keep `HOST_RESERVE_GIB=28` unless you have measured unified-memory stability on your own machine.
 - Do not confuse scheduler capacity with full-context concurrency. A launch reporting about 1.07M KV tokens can support roughly four simultaneous 262K-context sessions; the actual number moves slightly with runtime allocation.
 - Bind vLLM to loopback port `8001` and put authentication/TLS in a stable gateway in front of it. The public API URL, keys, and client-facing model alias should survive every model reload.
@@ -156,7 +156,11 @@ The optional gateway can supply Qwen model-card sampling values for clients that
 | `top_k` | `20` | `20` |
 | `presence_penalty` | `1.5` | `0` |
 
-The higher `presence_penalty` in the thinking-off profile is intentional: it reduces repeated tool calls and loop-prone replies when a client has not supplied its own sampling policy. Harnesses that already send their own values retain them, subject only to the `0.3` temperature floor.
+The higher `presence_penalty` in the thinking-off profile is intentional: it reduces loop-prone plain-chat replies when a client has not supplied its own sampling policy. For requests carrying `tools` or `response_format`, the gateway forces `presence_penalty=0` because structured JSON needs to repeat punctuation and key syntax reliably. Harnesses that already send their own values retain them, subject to this structured-output safety rule and the `0.3` temperature floor.
+
+### Gateway Output Limits
+
+The production gateway caps `max_tokens` and `max_completion_tokens` at `32768`, while thinking requests are capped at `8192` hidden reasoning tokens. Requests without an output limit receive the same 32K default. These guardrails prevent an unbounded reasoning turn from consuming an entire agent session while leaving enough room for deliberate long-form work.
 
 ## Required Components And Provenance
 
