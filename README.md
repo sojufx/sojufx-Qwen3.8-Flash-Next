@@ -19,6 +19,12 @@ The aim is not a synthetic peak. It is a fast, repeatable local server that keep
 | Scheduler capacity | 4 sequences |
 | Batched prefill limit | 2,048 tokens |
 | Decode graphs | `auto` |
+| Gateway output cap | 32,768 completion tokens |
+| Gateway thinking cap | 8,192 reasoning tokens |
+| Plain-chat default presence penalty | `1.5` with thinking off |
+| Tools / JSON default presence penalty | `0` |
+
+The backend settings are in `.env.production`. The output caps and sampling policy belong to the optional gateway, not vLLM itself; copying the backend environment alone does not install that policy. See [Gateway Sampling Defaults](#gateway-sampling-defaults) and `.env.gateway.example` below.
 
 The 24K draft vocabulary is the selected efficiency lever in this configuration. It makes each MTP draft step lighter while the target model still verifies the proposed tokens. The production profile uses exact speculative verification (`VLLM_TOKENV3_ALPHA=0`); the TokenV3 overlay remains available for separate permissive-verifier experiments.
 
@@ -100,6 +106,8 @@ git clone https://github.com/sojufx/sojufx-Qwen3.8-Flash-Next.git \
 
 cd /opt/qwen38-flash-runtime
 cp /opt/sojufx-qwen38-flash-next/.env.production .env
+mkdir -p files
+cp /opt/sojufx-qwen38-flash-next/files/draft_vocab_en_code_24k.txt files/
 ./download.sh
 ./start.sh
 ```
@@ -156,11 +164,41 @@ The optional gateway can supply Qwen model-card sampling values for clients that
 | `top_k` | `20` | `20` |
 | `presence_penalty` | `1.5` | `0` |
 
-The higher `presence_penalty` in the thinking-off profile is intentional: it reduces loop-prone plain-chat replies when a client has not supplied its own sampling policy. For requests carrying `tools` or `response_format`, the gateway forces `presence_penalty=0` because structured JSON needs to repeat punctuation and key syntax reliably. Harnesses that already send their own values retain them, subject to this structured-output safety rule and the `0.3` temperature floor.
+The higher `presence_penalty` in the thinking-off profile is intended to reduce repetitive plain-chat replies, but it does not guarantee that an agent will finish a task or never loop. For requests carrying a nonempty `tools` list or `response_format`, the gateway supplies `presence_penalty=0` when the client omits it, avoiding a default repetition penalty on structured output. Explicit client sampling values, including an explicit presence penalty, are preserved apart from the `0.3` temperature floor. Set `presence_penalty=0` in the client too if it supplies its own nonzero value for tools or JSON.
+
+Thinking is off by default. Ordinary explicit thinking requests are mapped to medium effort by the production guard; an explicit `enable_thinking=false` remains off. These are gateway request policies, not a claim that changing temperature fixes every tool-use problem.
 
 ### Gateway Output Limits
 
 The production gateway caps `max_tokens` and `max_completion_tokens` at `32768`, while thinking requests are capped at `8192` hidden reasoning tokens. Requests without an output limit receive the same 32K default. These guardrails prevent an unbounded reasoning turn from consuming an entire agent session while leaving enough room for deliberate long-form work.
+
+The thinking limit is passed upstream as `thinking_token_budget`; it requires backend support. Reasoning and visible output share the request's overall completion budget, so the 8K thinking cap is not an extra allowance on top of 32K output.
+
+### Apply The Gateway Settings
+
+This repository provides the backend profile and a gateway environment example, not a complete gateway implementation. For an existing guard proxy implementing the sampling rules above, install `.env.gateway.example` as its environment file, set your own authentication key separately, and restart only that proxy. These settings do not require a model reload.
+
+For a systemd-managed guard, add the following with `sudo systemctl edit <your-gateway-service>` (replace the placeholder with your service name):
+
+```ini
+[Service]
+Environment=MAX_COMPLETION_TOKENS=32768
+Environment=THINKING_TOKEN_BUDGET=8192
+Environment=DEFAULT_ENABLE_THINKING=false
+Environment=SAMPLING_GUARD=1
+Environment=MIN_TEMPERATURE=0.3
+```
+
+Then run `sudo systemctl daemon-reload` and `sudo systemctl restart <your-gateway-service>`. The sampling dictionaries and tools/JSON exception must also exist in your proxy code; environment variables alone do not implement them. Preserve your existing public URL, credentials and model alias when changing the backend.
+
+### Check Before Sharing Or Deploying
+
+- Confirm the running container has `VLLM_TOKENV3_ALPHA=0`, not merely that the environment file says so.
+- Confirm its arguments include `--max-num-seqs 4`, `--max-model-len 262144` and `--kv-cache-dtype fp8`.
+- Confirm `/root/draft_vocab.txt` is mounted from the included 24K file and matches the SHA256 above.
+- Confirm the effective gateway environment has the 32K completion and 8K thinking limits.
+- Test plain chat, a request with tools, and a request with `response_format`. When the client omits the penalty, the forwarded defaults should be `1.5`, `0`, and `0` respectively with thinking off.
+- Verify `/v1/models`, a completion, streaming and a real tool call through your authenticated public gateway, not only directly against vLLM.
 
 ## Required Components And Provenance
 
