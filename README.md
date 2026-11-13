@@ -2,7 +2,7 @@
 
 The Sojufx production setup for `nvidia/Qwen3.8-Flash-Next-FP4-Local` on one NVIDIA DGX Spark (GB10): the native
 [TensorFold](https://github.com/ashhart/TensorFold) engine with [MiaAI-Lab's Flash-Next recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold)
-(patches 0001 to 0017), plus four changes of our own: copy drafts, an 8-bit output layer with 16-bit rescoring, and two fixes.
+(patches 0001 to 0017), plus four changes of my own: copy drafts, an 8-bit output layer with 16-bit rescoring, and two fixes.
 Full 262K context, FP8 KV cache, vision on, 4 concurrent users.
 
 ## sparkDash Decode Bench
@@ -34,11 +34,11 @@ Aggregate is total decode tokens over the shared decode window; per request is t
 | 2 | 93.6 tok/s | 48.0 tok/s | 363 ms |
 | 4 | 126.5 tok/s | 33.2 tok/s | 695 ms |
 
-Structured at 4 requests is left out: in that one wave two of the four streams ran far slower than the rest, and we have not yet
+Structured at 4 requests is left out: in that one wave two of the four streams ran far slower than the rest, and I have not yet
 repeated it. Code and structured text draft well, so they run fastest; prose is the harder case. Each figure is a single wave, so
 expect a few percent of run-to-run spread.
 
-Against our earlier vLLM recipe (now in [`vllm/`](vllm/README.md)), the same sparkDash structured test went from 66.2 to
+Against my earlier vLLM recipe (now in [`vllm/`](vllm/README.md)), the same sparkDash structured test went from 66.2 to
 107.8 tok/s at one request (+63%) and from 109.7 to 155.4 tok/s at two (+42%).
 
 ## What Is Running
@@ -48,7 +48,7 @@ Against our earlier vLLM recipe (now in [`vllm/`](vllm/README.md)), the same spa
 | Model | `nvidia/Qwen3.8-Flash-Next-FP4-Local`, revision `b9ce18a6` |
 | Weight overlay | MiaAI's optional `ABLIT=1`: drowzeys/Keys `house-qsa` overlay (24 attention output tensors). The numbers above were measured with it on. |
 | Engine | TensorFold v1.1.4 native (`tensorfold-native serve`) |
-| Patches | MiaAI-Lab 0001 to 0017, then ours (below) |
+| Patches | MiaAI-Lab 0001 to 0017, then mine (below) |
 | Context | 262,144 tokens |
 | Concurrency | `--parallel 4` |
 | KV cache | FP8 |
@@ -68,11 +68,11 @@ Main engine settings: `TF_FLASHNEXT_DRAFTS=6`, `TF_FLASHNEXT_CONFIDENCE=-0.4`, `
 `TF_FLASHNEXT_DRAFT_AHEAD=1`, `TF_FLASHNEXT_KEEP_LATE=1`, `TF_FLASHNEXT_GATHER_READ=pread`, `TF_FLASHNEXT_HEAD8=1`,
 `TENSORFOLD_MEMORY_RESERVE_GIB=10`.
 
-## Our Changes On Top Of MiaAI-Lab's Recipe
+## My Changes On Top Of MiaAI-Lab's Recipe
 
 - **Copy drafts (copy32).** When the reply repeats text already in the conversation (file edits, tool output echoes), a lone stream
   can propose up to 31 copied tokens at once, after an 8-token match. The model still verifies every token. Copy-heavy single-user
-  replies ran about 58% faster in our tests.
+  replies ran about 58% faster in my tests.
 - **8-bit output layer with 16-bit rescoring (`TF_FLASHNEXT_HEAD8=1`).** The 248,320-word output layer is about 5 ms of each 38 ms
   decode pass. An FP8 copy picks the top 64 candidates, and those are recomputed from the original BF16 weights. Over 21,357 decode
   positions it chose the same token as the full BF16 layer every time. It applies only to plain greedy decoding; sampling, JSON or
