@@ -1,0 +1,448 @@
+Subject: Backport shared-prefix admission wait; Robert Wojciechowski and TensorFold authors, upstream 6588b5a1e535e72013a3178fd33522ecf30fae76.
+Origin: Robert Wojciechowski and TensorFold authors, upstream 6588b5a1e535e72013a3178fd33522ecf30fae76.
+License: MIT (TensorFold contributors and sojufx)
+
+diff --git a/RUNBOOK.md b/RUNBOOK.md
+--- a/RUNBOOK.md
++++ b/RUNBOOK.md
+@@ -176,6 +176,10 @@
+ them off. A state kept inside a prompt chunk costs no extra prompt call. A Nemotron 3.5 Lightning state takes 48 MiB plus
+ 7 KiB a prompt token, in whole 2 MiB pages (62 MiB at 2,048 tokens), and the cache keeps four 48 MiB buffers of its
+ budget free for the next states.
++Prompts fill a chunk at a time between decode rounds, so requests that arrive together on a new system prompt would each
++compute it. A request whose prompt shares a cut another prompt is still filling, which its own lookup would resume, waits
++in the queue until that fill stands there, then resumes the cut. `TENSORFOLD_PREFIX_WAIT_MS` bounds the wait (60000 by
++default; 0 turns it off).
+ `TF_HEAT_HIGH` and `TF_HEAT_LOW`, in degrees Celsius and set together, make each prompt chunk wait while the hottest
+ thermal zone (under `/sys/class/thermal`, or `TF_HEAT_ROOT`) is above the high band, until it is at or under the low one.
+ The server logs `heat_wait_s`, a cancel ends the wait, and the reply's tokens do not change.
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -76,6 +76,7 @@
+     /// opt-in: a family round planner (prompt pieces, decode rows in one pass); null: whole or `prefill_step` prompts
+     rounds: ?Rounds = null,
+     pieces: std.ArrayList(Rounds.Piece) = .empty,
++    prefix: @import("lane_host_prefix.zig").Wait = .{}, // a request's wait for a cut another prompt is filling
+     finals: std.ArrayList(usize) = .empty,
+ 
+     pub const ThreadInit = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) anyerror!void };
+@@ -85,7 +86,7 @@
+     pub const Job = @import("lane_job.zig").Job;
+ 
+     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
+-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = info_.ofLanes() };
++        return .{ .gpa = gpa, .io = io, .core = core, .info_ = info_.ofLanes(), .prefix = .fromEnv() };
+     }
+ 
+     pub fn start(h: *LaneHost) !void {
+@@ -477,6 +478,7 @@
+         recalls.release(job);
+         job.started = false;
+         job.fill_began = false;
++        job.reached = 0;
+         job.entry = null; // looked up again at its next admission
+         h.gpa.free(job.marks);
+         job.marks = &.{};
+diff --git a/zig/src/core/lane_host_admit.zig b/zig/src/core/lane_host_admit.zig
+--- a/zig/src/core/lane_host_admit.zig
++++ b/zig/src/core/lane_host_admit.zig
+@@ -3,17 +3,30 @@
+ const LaneHost = @import("lane_host.zig").LaneHost;
+ const Job = LaneHost.Job;
+ const lanes = @import("lanes");
++const prefix = @import("lane_host_prefix.zig");
+ 
+ /// The queued job to admit (its index), or null to hold; the caller holds the lock and a lane is free.
+ pub fn pick(h: *LaneHost) ?usize {
+-    const a = h.info_.admit orelse return 0;
+-    if (h.core.activeCount() == 0) return 0; // alone: the whole pool is free (kept prefixes give their blocks back)
+-    const head = h.queued.items[0];
+-    if (fits(a, head)) return 0;
++    prefix.release(h); // requests whose awaited cut is in (or will not come) go on first
++    while (true) { // a request that waits for a cut another prompt is filling stays queued, passed over
++        const at = choose(h) orelse return null;
++        if (!prefix.waits(h, h.queued.items[at])) return at;
++    }
++}
++
++/// The head, or one behind a head that waits for pool room, passing over prefix waiters.
++fn choose(h: *LaneHost) ?usize {
++    const first = for (h.queued.items, 0..) |j, i| {
++        if (!prefix.waiting(j)) break i;
++    } else return null;
++    const a = h.info_.admit orelse return first;
++    if (h.core.activeCount() == 0) return first; // alone: the whole pool is free (kept prefixes give their blocks back)
++    const head = h.queued.items[first];
++    if (fits(a, head)) return first;
+     if (head.waits_since == null) head.waits_since = h.admissions;
+     // it waits on the streams admitted before it waited: while one runs, later requests that fit go first; then none do
+     for (h.admitted.items) |j| if (j.seq < head.waits_since.?) {
+-        for (h.queued.items[1..], 1..) |j2, i| if (fits(a, j2)) return i;
++        for (h.queued.items[first + 1 ..], first + 1..) |j2, i| if (!prefix.waiting(j2) and fits(a, j2)) return i;
+         return null;
+     };
+     return null;
+diff --git a/zig/src/core/lane_host_prefix.zig b/zig/src/core/lane_host_prefix.zig
+new file mode 100644
+--- /dev/null
++++ b/zig/src/core/lane_host_prefix.zig
+@@ -0,0 +1,84 @@
++//! The prefix wait: a request whose prompt shares a cut another prompt is filling waits for that fill to keep it.
++const std = @import("std");
++const api = @import("engine_api.zig");
++const LaneHost = @import("lane_host.zig").LaneHost;
++const Job = LaneHost.Job;
++
++/// A queued request's wait for `leader` (a filling job, while it is still named `id`) to stand at `at`, from `since`.
++pub const Waiting = struct { leader: ?*const Job = null, id: api.Id = 0, at: u32 = 0, since: i96 = 0, waited: bool = false };
++
++/// The wait's bound (TENSORFOLD_PREFIX_WAIT_MS, 0: off) and what it did.
++pub const Wait = struct {
++    ns: i96 = @as(i96, default_ms) * std.time.ns_per_ms,
++    waits: u64 = 0, // requests that waited for another fill's cut
++    timeouts: u64 = 0, // of them, released at the bound with the cut not reached
++
++    pub const default_ms: u32 = 60_000;
++
++    pub fn fromEnv() Wait {
++        return fromText(std.mem.span(std.c.getenv("TENSORFOLD_PREFIX_WAIT_MS") orelse return .{}));
++    }
++
++    /// A bound from its text: whole milliseconds, 0 off; anything else is the default.
++    pub fn fromText(text: []const u8) Wait {
++        const t = std.mem.trim(u8, text, " \t");
++        if (t.len == 0 or t[0] < '0' or t[0] > '9') return .{};
++        const ms = std.fmt.parseInt(u32, t, 10) catch return .{};
++        return .{ .ns = @as(i96, ms) * std.time.ns_per_ms };
++    }
++};
++
++/// Whether queued `job` waits for another fill's cut (the lock held).
++pub fn waiting(job: *const Job) bool {
++    return job.prefix.leader != null;
++}
++
++/// Whether `job`, picked for a lane, waits instead: a fill short of a cut its lookup would resume (lock held).
++pub fn waits(h: *LaneHost, job: *Job) bool {
++    if (job.prefix.waited or h.prefix.ns <= 0 or !h.core.fills()) return false; // a request waits once: no cycle
++    const store = h.cache orelse return false;
++    const r = job.request;
++    if (!keyed(r)) return false;
++    const spans = h.spans(r);
++    const have: u32 = if (store.find(r.cacheKey(), r.chunks, spans)) |e| e.at else 0;
++    const least = have +| @max(store.rules.min_gap, 1); // a cut this far past what is kept already
++    var best: Waiting = .{};
++    for (h.filling.items) |l| { // admitted fills never wait, so the oldest always runs
++        if (!l.started or l.prefilled != null or l.request.background or !keyed(l.request)) continue;
++        for (l.marks) |at| {
++            if (at <= l.reached or at < least or at <= best.at) continue;
++            if (store.wouldServe(r.cacheKey(), r.chunks, spans, l.request.cacheKey(), h.spans(l.request), at))
++                best = .{ .leader = l, .id = l.id, .at = at };
++        }
++    }
++    if (best.leader == null) return false;
++    best.since = std.Io.Clock.awake.now(h.io).toNanoseconds();
++    best.waited = true;
++    job.prefix = best;
++    h.prefix.waits += 1;
++    return true;
++}
++
++/// A request whose states the cache keys by its tokens alone, as the host's lookup does (no pictures).
++fn keyed(r: *const api.Request) bool {
++    return r.embedding == null and r.prompt_logprobs == null and !r.untaught and r.images.len == 0 and r.cacheKey().len > 0;
++}
++
++/// Waiting requests go on in queue order: their fill stood at the cut, left the fills, or the bound passed (lock held).
++pub fn release(h: *LaneHost) void {
++    var now: ?i96 = null;
++    for (h.queued.items) |job| {
++        const w = job.prefix;
++        const leader = w.leader orelse continue;
++        const live = for (h.filling.items) |l| {
++            if (l == leader and l.id == w.id) break l; // the same job, not a later one at its address
++        } else null;
++        if (live) |l| if (l.reached < w.at and l.prefilled == null) {
++            const t = now orelse std.Io.Clock.awake.now(h.io).toNanoseconds();
++            now = t;
++            if (t - w.since < h.prefix.ns) continue;
++            h.prefix.timeouts += 1;
++        };
++        job.prefix.leader = null;
++    }
++}
+diff --git a/zig/src/core/lane_host_prefix_test.zig b/zig/src/core/lane_host_prefix_test.zig
+new file mode 100644
+--- /dev/null
++++ b/zig/src/core/lane_host_prefix_test.zig
+@@ -0,0 +1,222 @@
++//! The prefix wait: prompts sharing a cut another prompt is filling compute it once (fake backend).
++const std = @import("std");
++const lanes = @import("lanes");
++const api = @import("engine_api.zig");
++const pc = @import("prompt_cache.zig");
++const prefix = @import("lane_host_prefix.zig");
++const LaneHost = api.LaneHost;
++const Id = api.Id;
++const Event = api.Event;
++const Request = api.Request;
++const Reason = api.Reason;
++const gpa = std.testing.allocator;
++
++const system_len = 1030; // the shared system prompt
++const cut = 1024; // its last start on the store's 16-row grid, the cut its fill keeps
++const prompt_len = system_len + 16;
++const unrelated = 4; // the request at this index starts with another system prompt
++
++const Snaps = struct {
++    fn bytes(_: *anyopaque, at: u32) u64 {
++        return 64 + 4 * @as(u64, at);
++    }
++    fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
++        const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++        return f.save(@ptrCast(@alignCast(owner.?)), at);
++    }
++    fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
++        return error.BackendRestores; // lane-core backends restore inside their own prompt pass
++    }
++    fn drop(ptr: *anyopaque, saved: pc.Saved) void {
++        const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++        f.drop(saved);
++    }
++};
++
++const Box = struct {
++    mutex: std.Io.Mutex = .init,
++    tokens: std.ArrayList(u32) = .empty,
++    cached: ?u32 = null,
++    done: ?Reason = null,
++    fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++        const b: *Box = @ptrCast(@alignCast(ctx));
++        b.mutex.lockUncancelable(std.testing.io);
++        defer b.mutex.unlock(std.testing.io);
++        switch (e.*) {
++            .prefilled => |c| b.cached = c,
++            .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
++            .finished => |f| b.done = f.reason,
++            else => {},
++        }
++    }
++    fn wait(b: *Box) Reason {
++        while (true) {
++            b.mutex.lockUncancelable(std.testing.io);
++            const d = b.done;
++            b.mutex.unlock(std.testing.io);
++            if (d) |r| return r;
++            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++        }
++    }
++};
++
++/// Each prompt chunk sleeps `slow_ms`; request `id` is cancelled as the first request's fill starts its chunk `at`.
++const Hook = struct {
++    engine: ?api.Engine = null,
++    slow_ms: i64 = 0,
++    at: usize = 0,
++    id: Id = 0, // 0: none
++    sent: bool = false,
++    fn call(ctx: *anyopaque, s: *lanes.Stream, chunk: usize) void {
++        const c: *Hook = @ptrCast(@alignCast(ctx));
++        if (c.slow_ms > 0) std.Io.sleep(std.testing.io, .fromMilliseconds(c.slow_ms), .awake) catch {};
++        if (c.sent or c.id == 0 or chunk != c.at or s.prompt()[system_len] != 300) return;
++        c.sent = true;
++        c.engine.?.cancel(c.id);
++    }
++};
++
++const Setup = struct {
++    wait_ms: ?u32 = null, // null: the default bound
++    stepped: bool = true, // prompts fill a chunk a step (prefill_step)
++    requests: usize = 5,
++    shared: u32 = system_len, // the shared block the requests name
++    hook: Hook = .{},
++};
++
++const Run = struct {
++    boxes: [8]Box = @splat(.{}),
++    reasons: [8]Reason = undefined,
++    cached: [8]?u32 = @splat(null),
++    waits: u64 = 0,
++    timeouts: u64 = 0,
++    queued_after: usize = 0,
++
++    fn deinit(r: *Run) void {
++        for (&r.boxes) |*b| b.tokens.deinit(gpa);
++    }
++};
++
++/// The prompt of request `i`: a system prompt (another for `unrelated`), then 16 tokens of its own.
++fn promptOf(buf: *[prompt_len]u32, i: usize) []const u32 {
++    const seed: u32 = if (i == unrelated) 500 else 100;
++    for (buf[0..system_len], 0..) |*t, k| t.* = seed + @as(u32, @intCast(k % 97));
++    for (buf[system_len..], 0..) |*t, k| t.* = 300 + @as(u32, @intCast(i * 16 + k));
++    return buf;
++}
++
++/// Every request queued before the host starts, so they arrive together, then each answered in full.
++fn fanout(su: Setup, out: *Run) !void {
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 13 };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, if (su.stepped) target.stepped() else target.backend(), clock.clock());
++    defer core.deinit();
++    const rules: pc.Rules = .{ .lookahead = 1, .min_prompt = 0, .planned = true, .grid = 16, .chunk = 16 };
++    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, rules, 1 << 24);
++    defer store.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 8 });
++    host.cache = &store;
++    if (su.wait_ms) |ms| host.prefix.ns = @as(i96, ms) * std.time.ns_per_ms;
++    const e = host.engine();
++    var hook = su.hook;
++    hook.engine = e;
++    target.prefill_hook = Hook.call;
++    target.prefill_hook_ctx = &hook;
++    var bufs: [8][prompt_len]u32 = undefined;
++    var reqs: [8]Request = undefined;
++    const shared = [_]u32{su.shared};
++    for (0..su.requests) |i| {
++        reqs[i] = .{ .prompt = promptOf(&bufs[i], i), .max_tokens = 6, .shared_prefixes = &shared };
++        try e.submit(@intCast(i + 1), &reqs[i], .{ .ctx = &out.boxes[i], .event = Box.event });
++    }
++    try host.start();
++    defer host.stop();
++    for (0..su.requests) |i| {
++        out.reasons[i] = out.boxes[i].wait();
++        out.cached[i] = out.boxes[i].cached;
++    }
++    host.lock();
++    out.queued_after = host.queued.items.len;
++    host.unlock();
++    out.waits = host.prefix.waits;
++    out.timeouts = host.prefix.timeouts;
++}
++
++test "prefix wait: requests on a system prompt another prompt is filling wait for its cut and resume it" {
++    var on: Run = .{};
++    defer on.deinit();
++    try fanout(.{}, &on);
++    var off: Run = .{};
++    defer off.deinit();
++    try fanout(.{ .wait_ms = 0 }, &off);
++    for (0..5) |i| {
++        try std.testing.expectEqual(Reason.length, on.reasons[i]);
++        try std.testing.expectEqualSlices(u32, off.boxes[i].tokens.items, on.boxes[i].tokens.items); // resumed == fresh
++    }
++    // the first computes the system prompt and three resume its cut; the unrelated one neither waits nor is waited for
++    try std.testing.expectEqualSlices(?u32, &.{ 0, cut, cut, cut, 0 }, on.cached[0..5]);
++    try std.testing.expectEqual(@as(u64, 3), on.waits);
++    try std.testing.expectEqual(@as(u64, 0), on.timeouts);
++    try std.testing.expectEqual(@as(usize, 0), on.queued_after);
++    // off (TENSORFOLD_PREFIX_WAIT_MS=0): every prompt filling side by side computes the system prompt itself
++    try std.testing.expectEqualSlices(?u32, &.{ 0, 0, 0, 0, 0 }, off.cached[0..5]);
++    try std.testing.expectEqual(@as(u64, 0), off.waits);
++}
++
++test "prefix wait: a cancelled leader releases its waiter, which computes the prefix itself" {
++    var r: Run = .{};
++    defer r.deinit();
++    try fanout(.{ .requests = 2, .hook = .{ .at = 3, .id = 1 } }, &r);
++    try std.testing.expectEqual(Reason.cancelled, r.reasons[0]);
++    try std.testing.expectEqual(Reason.length, r.reasons[1]);
++    try std.testing.expectEqual(@as(?u32, 0), r.cached[1]);
++    try std.testing.expectEqual(@as(u64, 1), r.waits);
++    try std.testing.expectEqual(@as(u64, 0), r.timeouts);
++}
++
++test "prefix wait: a waiter cancelled while it waits leaves the queue once; the fill runs on" {
++    var r: Run = .{};
++    defer r.deinit();
++    try fanout(.{ .requests = 2, .hook = .{ .at = 3, .id = 2 } }, &r);
++    try std.testing.expectEqual(Reason.length, r.reasons[0]);
++    try std.testing.expectEqual(Reason.cancelled, r.reasons[1]);
++    try std.testing.expectEqual(@as(u64, 1), r.waits);
++    try std.testing.expectEqual(@as(usize, 0), r.queued_after);
++}
++
++test "prefix wait: at the bound a waiter is released, counted, and fills beside the leader" {
++    var r: Run = .{};
++    defer r.deinit();
++    try fanout(.{ .requests = 2, .wait_ms = 1, .hook = .{ .slow_ms = 3 } }, &r);
++    try std.testing.expectEqual(Reason.length, r.reasons[1]);
++    try std.testing.expectEqual(@as(u64, 1), r.waits);
++    try std.testing.expectEqual(@as(u64, 1), r.timeouts);
++}
++
++test "prefix wait: whole prompt passes never wait, and the kept cut still serves the later requests" {
++    var r: Run = .{};
++    defer r.deinit();
++    try fanout(.{ .stepped = false }, &r);
++    try std.testing.expectEqualSlices(?u32, &.{ 0, cut, cut, cut, 0 }, r.cached[0..5]);
++    try std.testing.expectEqual(@as(u64, 0), r.waits);
++}
++
++test "prefix wait: a shared cut under the store's min_gap is not waited for" {
++    var r: Run = .{};
++    defer r.deinit();
++    try fanout(.{ .requests = 2, .shared = 130 }, &r); // its cut, 128, adds under 256 tokens past the waiter's hit
++    try std.testing.expectEqual(@as(u64, 0), r.waits);
++}
++
++test "prefix wait: TENSORFOLD_PREFIX_WAIT_MS is whole milliseconds, 0 off, anything else the default" {
++    const default_ns = @as(i96, prefix.Wait.default_ms) * std.time.ns_per_ms;
++    try std.testing.expectEqual(default_ns, prefix.Wait.fromText("").ns);
++    try std.testing.expectEqual(default_ns, prefix.Wait.fromText("x").ns);
++    try std.testing.expectEqual(default_ns, prefix.Wait.fromText("-5").ns);
++    try std.testing.expectEqual(default_ns, prefix.Wait.fromText("1.5").ns);
++    try std.testing.expectEqual(@as(i96, 0), prefix.Wait.fromText("0").ns);
++    try std.testing.expectEqual(@as(i96, 250) * std.time.ns_per_ms, prefix.Wait.fromText("250").ns);
++}
+diff --git a/zig/src/core/lane_host_test.zig b/zig/src/core/lane_host_test.zig
+--- a/zig/src/core/lane_host_test.zig
++++ b/zig/src/core/lane_host_test.zig
+@@ -572,4 +572,5 @@
+     _ = @import("lane_host_warm_test.zig");
+     _ = @import("lane_host_rows_test.zig");
+     _ = @import("lane_host_many_test.zig");
+-}
++    _ = @import("lane_host_prefix_test.zig");
++}
+diff --git a/zig/src/core/lane_job.zig b/zig/src/core/lane_job.zig
+--- a/zig/src/core/lane_job.zig
++++ b/zig/src/core/lane_job.zig
+@@ -36,6 +36,8 @@
+     kept0: u64 = 0, // the store's kept count when the job looked it up
+     seq: u64 = 0, // its admission's number
+     waits_since: ?u64 = null, // the admissions count when it first waited at the head for pool room
++    reached: u32 = 0, // the furthest mark its prompt pass has stood at, kept or not
++    prefix: @import("lane_host_prefix.zig").Waiting = .{}, // its wait for another fill's cut, while queued
+ 
+     /// Record first admission once, including a family planner and a background pass that later yields.
+     pub fn noteAdmission(job: *Job) void {
+@@ -50,6 +52,7 @@
+     /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
+     pub fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+         const job: *Job = @ptrCast(@alignCast(ptr));
++        job.reached = @max(job.reached, at); // a request waiting for this cut goes on, whether the store keeps it or not
+         job.reported(); // before a keep can evict the entry the pass restored
+         if (job.host.cache) |store| _ = store.keepBorn(job.cacheKey(), job.request.bornLen(), at, s, job.request.chunks, job.host.spans(job.request));
+     }
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -234,6 +234,13 @@
+         return best;
+     }
+ 
++    /// Whether the state another pass keeps at `at` of `kept` (`kept_spans`) would serve `prompt` as `find` does.
++    pub fn wouldServe(s: *const Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, kept: []const u32, kept_spans: []const modes.Span, at: u32) bool {
++        const n = @as(usize, at) + s.rules.lookahead;
++        if (at >= prompt.len or n > prompt.len or n > kept.len or !s.usable(at, starts)) return false;
++        return std.mem.eql(u32, prompt[0..n], kept[0..n]) and modes.equal(kept_spans, spans, at);
++    }
++
+     /// Find a kept token prefix with matching canonical spans through its position, leaving at least one row.
+     pub fn find(s: *Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span) ?*Entry {
+         var best: ?*Entry = null;
