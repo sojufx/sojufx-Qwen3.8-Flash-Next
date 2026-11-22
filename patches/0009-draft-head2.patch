@@ -1,0 +1,801 @@
+diff --git a/zig/kernels/cuda/flashnext_mtp.cu b/zig/kernels/cuda/flashnext_mtp.cu
+index f90fcd1..20ae83b 100644
+--- a/zig/kernels/cuda/flashnext_mtp.cu
++++ b/zig/kernels/cuda/flashnext_mtp.cu
+@@ -3,6 +3,7 @@
+ #include <cuda_bf16.h>
+ #include <math_constants.h>
+ #include <stdint.h>
++#include <cub/block/block_radix_sort.cuh>
+ 
+ namespace fn_mtp {
+ 
+@@ -77,6 +78,150 @@ static __device__ __forceinline__ unsigned int order_key(unsigned short u) {
+ }
+ }  // namespace fn_mtp
+ 
++extern "C" __global__ void fn_draft2_local(const unsigned short* scores, uint16_t* local_scores, int* local_cols,
++                                            float2* logsum, int n, int k) {
++    using Sort = cub::BlockRadixSort<uint16_t, 256, 4, int>;
++    __shared__ typename Sort::TempStorage storage;
++    __shared__ float partial[8];
++    const int thread = threadIdx.x;
++    const int tile = blockIdx.y * gridDim.x + blockIdx.x;
++    const auto* row = scores + blockIdx.y * n;
++    uint16_t keys[4];
++    int cols[4];
++    float values[4];
++#pragma unroll
++    for (int item = 0; item < 4; ++item) {
++        const int col = blockIdx.x * 1024 + thread * 4 + item;
++        const uint16_t raw = col < n ? row[col] : 0xff80;
++        values[item] = __uint_as_float(static_cast<uint32_t>(raw) << 16);
++        keys[item] = isfinite(values[item]) ? fn_mtp::order_key(raw) : 0;
++        cols[item] = col;
++    }
++    Sort(storage).SortDescending(keys, cols);
++    if (thread == 0) {
++        const uint16_t key = keys[0];
++        const uint16_t raw = key == 0 ? 0xff80 : key & 0x8000 ? key & 0x7fff : ~key;
++        partial[0] = __uint_as_float(static_cast<uint32_t>(raw) << 16);
++    }
++    __syncthreads();
++    const float top = partial[0];
++    __syncthreads();
++    float sum = 0;
++#pragma unroll
++    for (int item = 0; item < 4; ++item) {
++        if (blockIdx.x * 1024 + thread * 4 + item < n) {
++            sum += isfinite(values[item]) ? expf(values[item] - top) : CUDART_NAN_F;
++        }
++    }
++    for (int offset = 16; offset; offset >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, offset);
++    if ((thread & 31) == 0) partial[thread / 32] = sum;
++    __syncthreads();
++    if (thread == 0) {
++        sum = 0;
++        for (float value : partial) sum += value;
++        logsum[tile] = make_float2(top, sum);
++    }
++#pragma unroll
++    for (int item = 0; item < 4; ++item) {
++        const int rank = thread * 4 + item;
++        if (rank < k) {
++            local_scores[tile * k + rank] = keys[item];
++            local_cols[tile * k + rank] = cols[item];
++        }
++    }
++}
++
++extern "C" __global__ void fn_draft2_merge(const uint16_t* local_scores, const int* local_cols, int* selected,
++                                           int tiles, int k) {
++    using Sort = cub::BlockRadixSort<uint16_t, 256, 5, int>;
++    __shared__ typename Sort::TempStorage storage;
++    uint16_t keys[5];
++    int cols[5];
++    const int count = tiles * k;
++#pragma unroll
++    for (int item = 0; item < 5; ++item) {
++        const int rank = threadIdx.x * 5 + item;
++        keys[item] = rank < count ? local_scores[blockIdx.x * count + rank] : 0;
++        cols[item] = rank < count ? local_cols[blockIdx.x * count + rank] : -1;
++    }
++    Sort(storage).SortDescending(keys, cols);
++#pragma unroll
++    for (int item = 0; item < 5; ++item) {
++        const int rank = threadIdx.x * 5 + item;
++        if (rank < k) selected[blockIdx.x * k + rank] = keys[item] ? cols[item] : -1;
++    }
++}
++
++extern "C" __global__ void fn_draft2_rescore(const __nv_bfloat16* input, const float* sums, const uint32_t* words,
++                                             const __nv_bfloat16* scales, const __nv_bfloat16* biases,
++                                             const __nv_bfloat16* approx, const float2* logsum, const int* selected,
++                                             float* result, int n, int padded, int width, int tiles, int k) {
++    const int row = blockIdx.x;
++    const int thread = threadIdx.x;
++    const int lane = thread & 31;
++    const int rank = thread / 32;
++    const int col = rank < k ? selected[row * k + rank] : -1;
++    const int groups = width / 32;
++    const auto* x = input + row * width;
++    const auto* xs = sums + row * groups;
++    __shared__ float exact[16];
++    __shared__ float old[16];
++    __shared__ float top;
++    __shared__ float mass[32];
++    float acc = 0;
++    if (col >= 0) {
++        const int col8 = col % 8;
++        const int tile8 = (col % 64) / 8;
++        const int offset = (lane % 8) / 2;
++        const int shift = (lane / 8 + (lane & 1) * 4) * 4;
++        const size_t start = static_cast<size_t>(col / 64) * groups * 256 + tile8 * 32 + col8 * 4 + offset;
++        for (int group = 0; group < groups; ++group) {
++            const uint32_t word = words[start + group * 256];
++            float dot = __bfloat162float(x[group * 32 + lane]) * ((word >> shift) & 15);
++            for (int delta = 16; delta; delta >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, delta);
++            if (!lane) {
++                const size_t index = static_cast<size_t>(group) * padded + col;
++                acc = __fmaf_rn(xs[group], __bfloat162float(biases[index]),
++                                __fmaf_rn(dot, __bfloat162float(scales[index]), acc));
++            }
++        }
++    }
++    if (!lane) {
++        exact[rank] = col < 0 ? -CUDART_INF_F : __bfloat162float(__float2bfloat16_rn(acc));
++        old[rank] = col < 0 ? -CUDART_INF_F : __bfloat162float(approx[row * n + col]);
++    }
++    if (thread == 0) {
++        top = -CUDART_INF_F;
++        for (int tile = 0; tile < tiles; ++tile) top = fmaxf(top, logsum[row * tiles + tile].x);
++    }
++    __syncthreads();
++    if (thread < 32) {
++        float sum = 0;
++        for (int tile = thread; tile < tiles; tile += 32) {
++            const float2 stats = logsum[row * tiles + tile];
++            sum += stats.y * expf(stats.x - top);
++        }
++        mass[thread] = sum;
++    }
++    __syncthreads();
++    if (thread == 0) {
++        float best = -CUDART_INF_F;
++        int index = 0x7fffffff;
++        float total = 0, old_top = 0;
++        for (float value : mass) total += value;
++        for (int item = 0; item < k; ++item) {
++            fn_mtp::better(best, index, exact[item], selected[row * k + item]);
++            old_top += expf(old[item] - top);
++        }
++        float sum = fmaxf(0, total - old_top) * expf(top - best);
++        for (int item = 0; item < k; ++item) sum += expf(exact[item] - best);
++        result[row * 4] = best;
++        result[row * 4 + 1] = isfinite(total) ? best + logf(sum) : CUDART_NAN_F;
++        result[row * 4 + 2] = __int_as_float(index);
++        result[row * 4 + 3] = 0;
++    }
++}
++
+ // A row's K best of its first V values as drawRow ranks them (ties: lowest columns): those above the K-th, then ties.
+ extern "C" __global__ void __launch_bounds__(1024) fn_row_topk(const __nv_bfloat16* __restrict__ L, int V, long long ld,
+                                                                int K, unsigned short* __restrict__ out_v,
+diff --git a/zig/kernels/cuda/qmm.cu b/zig/kernels/cuda/qmm.cu
+index 64066f7..726a7ee 100644
+--- a/zig/kernels/cuda/qmm.cu
++++ b/zig/kernels/cuda/qmm.cu
+@@ -11,12 +11,16 @@ namespace tf_qmm {
+ 
+ using namespace qmm_frag;
+ 
+-template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool CLUSTER, bool PIPE = false>
++template <int Group, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool CLUSTER, bool PIPE = false>
+ __global__ void __launch_bounds__(WM * WN * 32) qmm_kernel(
+         const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const uint32_t* __restrict__ w,
+         const __nv_bfloat16* __restrict__ scales, const __nv_bfloat16* __restrict__ biases,
+         void* __restrict__ out, float* __restrict__ part, int M, int N, int K, int SK, int npad, int ldx, int group) {
++    constexpr bool Draft2 = Group < 0;
++    constexpr int GS = Draft2 ? -Group : Group;
+     using T = LaneTile<GS, BM, BN, WM, WN, STAGES>;
++    constexpr int W = T::W / (Draft2 ? 2 : 1);
++    constexpr int STAGE = T::STAGE - (T::W - W);
+     extern __shared__ __align__(128) unsigned char buf[];
+     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+     const int wm = warp / WN, wn = warp % WN;
+@@ -24,7 +28,7 @@ __global__ void __launch_bounds__(WM * WN * 32) qmm_kernel(
+     const int2 at = tile_of(blockIdx.x, M, N, BM, BN, group);
+     const int m0 = at.x, n0 = at.y, slice = blockIdx.z, g0 = slice * per;
+ 
+-    auto stage = [&](int s) { return buf + s * T::STAGE; };
++    auto stage = [&](int s) { return buf + s * STAGE; };
+     auto load = [&](int s, int g, int m0) {
+         unsigned char* p = stage(s);
+         for (int c = tid; c < BM * T::CHUNKS; c += T::THREADS) {
+@@ -34,13 +38,13 @@ __global__ void __launch_bounds__(WM * WN * 32) qmm_kernel(
+                   m0 + r < M);
+         }
+         unsigned char* pw = p + T::X;
+-        constexpr int TILE_BYTES = 64 * GS / 2;           // one stored 64-column tile's group block
+-        for (int c = tid; c < T::W / 16; c += T::THREADS) {
++        constexpr int TILE_BYTES = 64 * GS / (Draft2 ? 4 : 2);
++        for (int c = tid; c < W / 16; c += T::THREADS) {
+             const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
+             const size_t tile = static_cast<size_t>(n0 / 64 + t) * KG + g;
+             cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + off * 16);
+         }
+-        unsigned char* ps = pw + T::W;
++        unsigned char* ps = pw + W;
+         for (int c = tid; c < 2 * (T::S / 16); c += T::THREADS) {
+             const int which = c / (T::S / 16), off = c % (T::S / 16);
+             const __nv_bfloat16* src = (which ? biases : scales) + static_cast<size_t>(g) * npad + n0 + off * 8;
+@@ -84,14 +88,22 @@ __global__ void __launch_bounds__(WM * WN * 32) qmm_kernel(
+             commit();
+             const unsigned char* p = stage(it % STAGES);
+             const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
+-            const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(p + T::X + T::W);
+-            const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
++            const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(p + T::X + W);
++            const float* px = reinterpret_cast<const float*>(p + T::X + W + 2 * T::S);
+             uint32_t words[T::NT][GS / 32];
+ #pragma unroll
+             for (int j = 0; j < T::NT; ++j)
+ #pragma unroll
+                 for (int v = 0; v < GS / 32; ++v)
+-                    words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
++                    if constexpr (Draft2) {
++                        const auto* packed = reinterpret_cast<const uint16_t*>(pw);
++                        uint32_t bits = packed[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
++                        bits = (bits | bits << 8) & 0x00ff00ff;
++                        bits = (bits | bits << 4) & 0x0f0f0f0f;
++                        words[j][v] = (bits | bits << 2) & 0x33333333;
++                    } else {
++                        words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
++                    }
+             float d[T::MT][T::NT][4];
+ #pragma unroll
+             for (int kt = 0; kt < GS / 16; ++kt) {
+@@ -229,3 +241,8 @@ template __global__ void tf_qmm::qmm_kernel<32, 16, 64, 1, 4, 4, false, false, f
+     const __nv_bfloat16* __restrict__, const float* __restrict__, const uint32_t* __restrict__,
+     const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, void* __restrict__, float* __restrict__, int,
+     int, int, int, int, int, int);
++
++template __global__ void tf_qmm::qmm_kernel<-32, 16, 64, 1, 4, 4, false, false, false>(
++    const __nv_bfloat16* __restrict__, const float* __restrict__, const uint32_t* __restrict__,
++    const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, void* __restrict__, float* __restrict__, int,
++    int, int, int, int, int, int);
+diff --git a/zig/src/families/flashnext/cuda_draft2.zig b/zig/src/families/flashnext/cuda_draft2.zig
+new file mode 100644
+index 0000000..c800258
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_draft2.zig
+@@ -0,0 +1,192 @@
++const std = @import("std");
++const cuda = @import("cuda");
++const wt = @import("cuda_prompt_wt.zig");
++const dims = wt.dims;
++const groups = dims / 32;
++const tile = 64;
++const chunk = 1024;
++const max_lanes = 16;
++
++pub fn shortlist() !usize {
++    const raw = std.c.getenv("TF_FLASHNEXT_DRAFT_HEAD2") orelse return 0;
++    const value = std.mem.span(raw);
++    if (std.mem.eql(u8, value, "0")) return 0;
++    if (std.mem.eql(u8, value, "8")) return 8;
++    if (std.mem.eql(u8, value, "16")) return 16;
++    return error.BadDraftHead2;
++}
++
++fn promote(bits: u16) f32 {
++    return @bitCast(@as(u32, bits) << 16);
++}
++
++fn code(x: f32) u16 {
++    return @intFromFloat(@round(std.math.clamp(x, 0, 3)));
++}
++
++const Fit = struct { step: f32, offset: f32 };
++
++fn fit(hist: [16]u8, lo: u8, hi: u8) Fit {
++    if (hi == lo) return .{ .step = 1, .offset = @floatFromInt(lo) };
++    const initial: Fit = .{ .step = @as(f32, @floatFromInt(hi - lo)) / 3, .offset = @floatFromInt(lo) };
++    var best = initial;
++    var best_error = std.math.inf(f32);
++    for ([_]f32{ 1.0, 0.8 }) |factor| {
++        var form: Fit = .{ .step = initial.step * factor, .offset = initial.offset + initial.step * 1.5 * (1 - factor) };
++        for (0..4) |_| {
++            var sq: f32 = 0;
++            var sq2: f32 = 0;
++            var sv: f32 = 0;
++            var sqv: f32 = 0;
++            var err: f32 = 0;
++            for (hist, 0..) |count, val| {
++                if (count == 0) continue;
++                const weight: f32 = @floatFromInt(count);
++                const value: f32 = @floatFromInt(val);
++                const q: f32 = @floatFromInt(code((value - form.offset) / form.step));
++                sq += weight * q;
++                sq2 += weight * q * q;
++                sv += weight * value;
++                sqv += weight * q * value;
++                const residual = value - (form.step * q + form.offset);
++                err += weight * residual * residual;
++            }
++            if (err < best_error) {
++                best = form;
++                best_error = err;
++            }
++            const denom = 32 * sq2 - sq * sq;
++            if (denom <= 0) break;
++            const step = (32 * sqv - sq * sv) / denom;
++            if (step <= 0) break;
++            form = .{ .step = step, .offset = (sv - step * sq) / 32 };
++        }
++    }
++    return best;
++}
++
++pub fn pack(a: std.mem.Allocator, d: *const cuda.Driver, words: []const u8, scales: []const u8, biases: []const u8, n: usize) !wt.Q4 {
++    const padded = (n + 127) / 128 * 128;
++    const bits = try a.alloc(u16, padded * dims / 8);
++    defer a.free(bits);
++    const tables = try a.alloc(u16, 2 * padded * groups);
++    defer a.free(tables);
++    @memset(bits, 0);
++    @memset(tables, 0);
++    for (0..n) |col| {
++        for (0..groups) |group| {
++            const at = (col * groups + group) * 16;
++            var hist: [16]u8 = @splat(0);
++            var lo: u8 = 15;
++            var hi: u8 = 0;
++            var raw: [32]u8 = undefined;
++            for (words[at..][0..16], 0..) |pair, index| {
++                raw[index * 2] = pair & 15;
++                raw[index * 2 + 1] = pair >> 4;
++            }
++            for (raw) |value| {
++                hist[value] += 1;
++                lo = @min(lo, value);
++                hi = @max(hi, value);
++            }
++            const form = fit(hist, lo, hi);
++            const src = (col * groups + group) * 2;
++            const affine_scale = promote(std.mem.readInt(u16, scales[src..][0..2], .little));
++            const affine_bias = promote(std.mem.readInt(u16, biases[src..][0..2], .little));
++            const dst = group * padded + col;
++            const bf16 = @import("core").bf16_round.bits;
++            tables[dst] = bf16(form.step * affine_scale);
++            tables[padded * groups + dst] = bf16(@mulAdd(f32, form.offset, affine_scale, affine_bias));
++            const base = ((col / tile * groups + group) * tile + col % tile) * 4;
++            const offsets = [_]usize{ 0, 8, 16, 24, 1, 9, 17, 25 };
++            for (0..4) |part| {
++                var packed_word: u16 = 0;
++                for (offsets, 0..) |offset, index| {
++                    const value: f32 = @floatFromInt(raw[2 * part + offset]);
++                    packed_word |= code((value - form.offset) / form.step) << @intCast(index * 2);
++                }
++                bits[base + part] = packed_word;
++            }
++        }
++    }
++    var weight = wt.Q4.empty(d);
++    errdefer weight.free();
++    weight.w = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(bits));
++    weight.s = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(tables[0 .. padded * groups]));
++    weight.b = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(tables[padded * groups ..]));
++    weight.n = n;
++    weight.k = dims;
++    return weight;
++}
++
++pub const Kernels = struct {
++    module: cuda.Module,
++    dot: cuda.Function,
++    local: cuda.Function,
++    merge: cuda.Function,
++    rescore: cuda.Function,
++    scratch: cuda.DeviceBuffer,
++    tiles: usize,
++    count: usize,
++
++    pub fn load(driver: *const cuda.Driver, mtp: cuda.Module, n: usize, count: usize) !Kernels {
++        const tiles = (n + chunk - 1) / chunk;
++        if (tiles * count > 1280) return error.UnexpectedTensor;
++        var module = try cuda.Module.load(driver, cuda.kernels.qmm);
++        errdefer module.unload();
++        return .{
++            .module = module,
++            .dot = try module.function("_ZN6tf_qmm10qmm_kernelILin32ELi16ELi64ELi1ELi4ELi4ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfPKjS3_S3_PvPfiiiiiii"),
++            .local = try mtp.function("fn_draft2_local"),
++            .merge = try mtp.function("fn_draft2_merge"),
++            .rescore = try mtp.function("fn_draft2_rescore"),
++            .scratch = try cuda.DeviceBuffer.alloc(driver, max_lanes * (tiles * 8 + tiles * count * 6 + count * 4 + 16)),
++            .tiles = tiles,
++            .count = count,
++        };
++    }
++
++    pub fn free(self: *Kernels) void {
++        self.scratch.free();
++        self.module.unload();
++    }
++
++    pub fn run(self: Kernels, st: cuda.Stream, weight: wt.Q4, affine: wt.Q4, x: u64, sums: u64, logits: u64, rows: usize) !u64 {
++        if (rows == 0 or rows > max_lanes) return error.UnexpectedTensor;
++        const n = affine.n;
++        const padded = (n + 127) / 128 * 128;
++        const local_cols = self.scratch.ptr;
++        const logsum = local_cols + max_lanes * self.tiles * self.count * 4;
++        const selected = logsum + max_lanes * self.tiles * 8;
++        const result = selected + max_lanes * self.count * 4;
++        const local_scores = result + max_lanes * 16;
++        var args: cuda.Args = .{};
++        for ([_]u64{ x, sums, weight.w.ptr, weight.s.ptr, weight.b.ptr, logits, 0 }) |arg| args.add(arg);
++        for ([_]usize{ rows, n, dims, 1, padded, dims, 1 }) |arg| args.add(@as(c_int, @intCast(arg)));
++        try cuda.launch.launch(self.dot, .{ .grid = .{ .x = @intCast((n + tile - 1) / tile) }, .block = .{ .x = 128 }, .shared = 7424 }, st, &args);
++        args = .{};
++        for ([_]u64{ logits, local_scores, local_cols, logsum }) |arg| args.add(arg);
++        args.add(@as(c_int, @intCast(n)));
++        args.add(@as(c_int, @intCast(self.count)));
++        try cuda.launch.launch(self.local, .{ .grid = .{ .x = @intCast(self.tiles), .y = @intCast(rows) }, .block = .{ .x = 256 } }, st, &args);
++        args = .{};
++        for ([_]u64{ local_scores, local_cols, selected }) |arg| args.add(arg);
++        args.add(@as(c_int, @intCast(self.tiles)));
++        args.add(@as(c_int, @intCast(self.count)));
++        try cuda.launch.launch(self.merge, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, st, &args);
++        args = .{};
++        for ([_]u64{ x, sums, affine.w.ptr, affine.s.ptr, affine.b.ptr, logits, logsum, selected, result }) |arg| args.add(arg);
++        for ([_]usize{ n, padded, dims, self.tiles, self.count }) |arg| args.add(@as(c_int, @intCast(arg)));
++        try cuda.launch.launch(self.rescore, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = @intCast(32 * self.count) } }, st, &args);
++        return result;
++    }
++};
++
++test "fit retains a flat group and exactly maps four equidistant codes" {
++    var hist: [16]u8 = @splat(0);
++    hist[9] = 32;
++    try std.testing.expectEqual(Fit{ .step = 1, .offset = 9 }, fit(hist, 9, 9));
++    hist[9] = 0;
++    for ([_]usize{ 1, 5, 9, 13 }) |index| hist[index] = 8;
++    try std.testing.expectEqual(Fit{ .step = 4, .offset = 1 }, fit(hist, 1, 13));
++}
+diff --git a/zig/src/families/flashnext/cuda_mtp.zig b/zig/src/families/flashnext/cuda_mtp.zig
+index b63faf3..ed95985 100644
+--- a/zig/src/families/flashnext/cuda_mtp.zig
++++ b/zig/src/families/flashnext/cuda_mtp.zig
+@@ -207,6 +207,8 @@ pub const Head = struct {
+     mixer: HcW,
+     /// lm_head's rows at `ids`, in their order.
+     draft: Q4,
++    draft2: ?Q4 = null,
++    draft2_kernels: ?@import("cuda_draft2.zig").Kernels = null,
+     ids: []const u32,
+     artifact: proposal.Artifact,
+     service: lanes.proposal_head.Service,
+@@ -255,12 +257,22 @@ pub const Head = struct {
+         errdefer h.artifact.deinit();
+         h.ids = h.artifact.ids();
+         h.service = try lanes.proposal_head.Service.legacy(gpa, &h.artifact);
+-        h.draft = try head_load.draft(gpa, driver, &store, &h.artifact, role);
++        const draft2 = @import("cuda_draft2.zig");
++        const shortlist = try draft2.shortlist();
++        if (shortlist != 0 and role != .affine4) return error.BadDraftHead2;
++        h.draft2 = null;
++        h.draft2_kernels = null;
++        h.draft = try head_load.draft(gpa, driver, &store, &h.artifact, role, &h.draft2);
+         errdefer h.draft.free();
++        errdefer if (h.draft2) |*weight| weight.free();
+         h.module = try cuda.Module.load(driver, cuda.kernels.flashnext_mtp);
+         errdefer h.module.unload();
+         h.best_fn = try h.module.function("fn_row_best");
+         h.topk_fn = try h.module.function("fn_row_topk");
++        if (h.draft2) |weight| {
++            h.draft2_kernels = try draft2.Kernels.load(driver, h.module, h.ids.len, shortlist);
++            std.log.info("Flash Next draft-only affine2 shortlist={d} vocab={d} bytes={d}", .{ shortlist, h.ids.len, weight.w.len + weight.s.len + weight.b.len });
++        }
+         return h;
+     }
+ 
+@@ -270,6 +282,8 @@ pub const Head = struct {
+     }
+ 
+     pub fn deinit(h: *Head) void {
++        if (h.draft2_kernels) |*kernels| kernels.free();
++        if (h.draft2) |*weight| weight.free();
+         h.module.unload();
+         h.draft.free();
+         h.artifact.deinit();
+@@ -287,6 +301,10 @@ pub const Head = struct {
+         return .{ .vocab = vocab, .logical = @intCast(map.ids.len), .stride = @intCast(map.ids.len), .ids = map.ids };
+     }
+ 
++    pub fn projectDraft2(h: *const Head, pass: anytype, rows: usize) !u64 {
++        return h.draft2_kernels.?.run(pass.stream, h.draft2.?, h.draft, pass.s.mixed, pass.s.xsm, pass.s.head_local, rows);
++    }
++
+     /// The BF16 legacy lane is the same qlinear owner; group-32 affine keeps its existing unqualified callback.
+     pub fn project(h: *const Head, pass: anytype, input: u64, sums: u64, out: u64, rows: usize) !void {
+         if (h.draft.native) |weight| {
+@@ -327,7 +345,8 @@ pub fn headBytes(fp8: bool) usize {
+     const experts = wt.experts_n * routed + nvfp4;
+     const attn = (wt.proj_n + dims) * dims / 2 * 5 / 4;
+     const draft = 79_591 * dims / 2 * 5 / 4;
+-    return experts + attn + draft + 2 * dims * dims / 2 * 5 / 4;
++    const reduced: usize = if ((@import("cuda_draft2.zig").shortlist() catch 0) != 0) 79_616 * dims * 3 / 8 + (1 << 20) else 0;
++    return experts + attn + draft + reduced + 2 * dims * dims / 2 * 5 / 4;
+ }
+ 
+ pub const Pick = @import("cuda_mtp_draft.zig").Pick;
+diff --git a/zig/src/families/flashnext/cuda_mtp_load.zig b/zig/src/families/flashnext/cuda_mtp_load.zig
+index 37062a6..54e28ed 100644
+--- a/zig/src/families/flashnext/cuda_mtp_load.zig
++++ b/zig/src/families/flashnext/cuda_mtp_load.zig
+@@ -12,7 +12,7 @@ pub fn mode() !Mode {
+     if (std.mem.eql(u8, value, "affine4")) return .affine4;
+     return error.BadDraftHead;
+ }
+-pub fn draft(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, artifact: *const core.proposal_vocab.Artifact, role: Mode) !wt.Q4 {
++pub fn draft(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, artifact: *const core.proposal_vocab.Artifact, role: Mode, reduced: *?wt.Q4) !wt.Q4 {
+     const ids = artifact.ids();
+     const affine = role == .affine4;
+     const tensor = try store.tensor("language_model.lm_head.weight");
+@@ -21,7 +21,7 @@ pub fn draft(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, artifact:
+         var selected = try (core.proposal_rows.Source{ .identity = artifact.identity(), .storage = .bf16, .recipe = .qlinear_decode, .codes = .{ .bytes = tensor.bytes, .stride = wt.dims * 2 } }).extract(a, artifact, 1, std.math.maxInt(usize));
+         defer selected.deinit();
+         const rows = selected.codes;
+-        if (affine) return quantized(a, d, rows, ids.len);
++        if (affine) return quantized(a, d, rows, ids.len, reduced);
+         return projection.dense(a, d, .{ .dtype = .bf16, .rank = 2, .shape = .{ ids.len, wt.dims, 1, 1, 1 }, .bytes = rows });
+     }
+     var buf: [120]u8 = undefined;
+@@ -34,10 +34,10 @@ pub fn draft(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, artifact:
+     if (head.w.len != wt.vocab * wrow or head.s.len != wt.vocab * grow) return error.UnexpectedTensor;
+     var selected = try (core.proposal_rows.Source{ .identity = artifact.identity(), .storage = .affine, .recipe = .qlinear_decode, .scale_dtype = .bf16, .bias_dtype = .bf16, .codes = .{ .bytes = head.w, .stride = wrow }, .scales = .{ .bytes = head.s, .stride = grow }, .biases = .{ .bytes = head.b, .stride = grow } }).extract(a, artifact, 1, std.math.maxInt(usize));
+     defer selected.deinit();
+-    return wt.uploadQ4(a, d, selected.codes, selected.scales, selected.biases, ids.len, wt.dims / 8);
++    return upload(a, d, selected.codes, selected.scales, selected.biases, ids.len, reduced);
+ }
+ 
+-fn quantized(a: std.mem.Allocator, d: *cuda.Driver, rows: []const u8, n: usize) !wt.Q4 {
++fn quantized(a: std.mem.Allocator, d: *cuda.Driver, rows: []const u8, n: usize, reduced: *?wt.Q4) !wt.Q4 {
+     const words = try a.alloc(u8, n * wt.dims / 2);
+     defer a.free(words);
+     const scales = try a.alloc(u8, n * wt.dims / 16);
+@@ -45,5 +45,12 @@ fn quantized(a: std.mem.Allocator, d: *cuda.Driver, rows: []const u8, n: usize)
+     const biases = try a.alloc(u8, scales.len);
+     defer a.free(biases);
+     for (0..n) |i| try @import("cuda_draft_affine.zig").row(rows[i * wt.dims * 2 ..][0 .. wt.dims * 2], words[i * wt.dims / 2 ..][0 .. wt.dims / 2], scales[i * wt.dims / 16 ..][0 .. wt.dims / 16], biases[i * wt.dims / 16 ..][0 .. wt.dims / 16]);
+-    return wt.uploadQ4(a, d, words, scales, biases, n, wt.dims / 8);
++    return upload(a, d, words, scales, biases, n, reduced);
++}
++
++fn upload(a: std.mem.Allocator, d: *cuda.Driver, words: []const u8, scales: []const u8, biases: []const u8, n: usize, reduced: *?wt.Q4) !wt.Q4 {
++    var affine = try wt.uploadQ4(a, d, words, scales, biases, n, wt.dims / 8);
++    errdefer affine.free();
++    if (try @import("cuda_draft2.zig").shortlist() != 0) reduced.* = try @import("cuda_draft2.zig").pack(a, d, words, scales, biases, n);
++    return affine;
+ }
+diff --git a/zig/src/families/flashnext/cuda_mtp_nonfinite_fixture.zig b/zig/src/families/flashnext/cuda_mtp_nonfinite_fixture.zig
+index a3587be..635df49 100644
+--- a/zig/src/families/flashnext/cuda_mtp_nonfinite_fixture.zig
++++ b/zig/src/families/flashnext/cuda_mtp_nonfinite_fixture.zig
+@@ -130,6 +130,8 @@ pub fn draft(d: *cuda.Driver, host: []u16) mtp.Draft {
+ pub fn head(d: *cuda.Driver) !mtp.Head {
+     const gpa = std.testing.allocator;
+     var h: mtp.Head = undefined;
++    h.draft2 = null;
++    h.draft2_kernels = null;
+     h.artifact = try core.proposal_vocab.legacy.artifact(gpa, &.{ 0, 3, 7 }, .{ .vocab = wt.vocab, .hidden = wt.dims, .format = "bf16", .group = 0, .scale_recipe = "fixture" });
+     h.ids = h.artifact.ids();
+     h.service = try @import("lanes").proposal_head.Service.legacy(gpa, &h.artifact);
+diff --git a/zig/src/families/flashnext/cuda_mtp_nonfinite_more_test.zig b/zig/src/families/flashnext/cuda_mtp_nonfinite_more_test.zig
+index 01b0af9..2aea8c1 100644
+--- a/zig/src/families/flashnext/cuda_mtp_nonfinite_more_test.zig
++++ b/zig/src/families/flashnext/cuda_mtp_nonfinite_more_test.zig
+@@ -35,8 +35,9 @@ const Flow = struct {
+     pub fn stream(o: @This()) cuda.Stream {
+         return o.st;
+     }
+-    pub fn forwardHeadMany(o: @This(), ds: []const *mtp.Draft, nexts: []const []const u32, rows: []const u64, scores: bool) !void {
++    pub fn forwardHeadMany(o: @This(), ds: []const *mtp.Draft, nexts: []const []const u32, rows: []const u64, scores: bool, reduced: bool) !void {
+         try t.expect(scores);
++        try t.expect(!reduced);
+         try t.expectEqual(ds.len, nexts.len);
+         try t.expectEqual(ds.len, rows.len);
+         o.calls.* += 1;
+diff --git a/zig/src/families/flashnext/cuda_mtp_ops.zig b/zig/src/families/flashnext/cuda_mtp_ops.zig
+index 67489ee..ab89431 100644
+--- a/zig/src/families/flashnext/cuda_mtp_ops.zig
++++ b/zig/src/families/flashnext/cuda_mtp_ops.zig
+@@ -20,6 +20,7 @@ const Group = struct {
+     nexts: []const []const u32,
+     rows: []const u64,
+     scores: bool,
++    reduced: bool,
+ };
+ 
+ const dims = wt.dims;
+@@ -108,7 +109,7 @@ pub fn Ops(comptime Tri: type) type {
+             const last = stop == ids.len;
+             try o.forwardMain(seq, ids[at..stop], .{ .logits = if (last) .last else .none, .streams = d.streams.ptr, .prompt = true, .marks = marks });
+             const head_to = @min(stop, ids.len - 1);
+-            if (head_to > at) try o.forwardHead(d, ids[at + 1 .. head_to + 1], d.streams.ptr, false);
++            if (head_to > at) try o.forwardHead(d, ids[at + 1 .. head_to + 1], d.streams.ptr, false, false);
+             if (last) d.prompt_last = d.streams.ptr + (stop - 1 - at) * wide * 2;
+         }
+ 
+@@ -124,7 +125,7 @@ pub fn Ops(comptime Tri: type) type {
+         }
+ 
+         /// The head over `next.len` rows of streams `rows`: cache at d.len, last row in d.out, scores in d.dlogits.
+-        pub fn forwardHead(o: Self, d: *Draft, next: []const u32, rows: u64, scores: bool) !void {
++        pub fn forwardHead(o: Self, d: *Draft, next: []const u32, rows: u64, scores: bool, reduced: bool) !void {
+             const e = o.e;
+             const tri = o.tri;
+             const h = o.h;
+@@ -152,7 +153,7 @@ pub fn Ops(comptime Tri: type) type {
+                 p.rows = m;
+                 p.pos0 = d.len;
+                 try p.stage(next[at..][0..m]);
+-                const one: pieces.Piece(Self, batch.Pass(Tri)) = .{ .o = o, .p = &p, .d = d, .input = rows + at * wide * 2, .m = m, .last = at + m == next.len, .score = at + m == next.len and scores };
++                const one: pieces.Piece(Self, batch.Pass(Tri)) = .{ .o = o, .p = &p, .d = d, .input = rows + at * wide * 2, .m = m, .last = at + m == next.len, .score = at + m == next.len and scores, .reduced = reduced };
+                 try pieces.runPiece(one, score_rows);
+                 d.len += m;
+                 at += m;
+@@ -160,32 +161,33 @@ pub fn Ops(comptime Tri: type) type {
+         }
+ 
+         /// Python draft.absorb: the chain's entries trimmed, then the kept rows (main streams `rows`, next tokens).
+-        pub fn absorb(o: Self, d: *Draft, next: []const u32, rows: u64, scores: bool) !void {
++        pub fn absorb(o: Self, d: *Draft, next: []const u32, rows: u64, scores: bool, reduced: bool) !void {
+             if (d.drafted > 0) {
+                 d.len -= d.drafted;
+                 d.drafted = 0;
+             }
+-            try o.forwardHead(d, next, rows, scores);
++            try o.forwardHead(d, next, rows, scores, reduced);
+         }
+ 
+         /// The draft at `position` and its temperature-1 probability (Python Engine.sample_draft).
+-        pub fn pick(o: Self, d: *Draft, position: u64, sm: ?Sampling) !Pick {
++        pub fn pick(o: Self, d: *Draft, position: u64, sm: ?Sampling, reduced: bool) !Pick {
+             const h = o.h;
+             const view_ = h.view();
+             const n = view_.logical;
+-            try h.best(o.stream(), d.dlogits.ptr, n, n, 1, d.best.ptr);
+-            try download(o.stream(), std.mem.sliceAsBytes(d.best_host[0..4]), d.best.ptr);
++            if (!reduced) try h.best(o.stream(), d.dlogits.ptr, n, n, 1, d.best.ptr);
++            try download(o.stream(), std.mem.sliceAsBytes(d.best_host[0..4]), if (reduced) d.dlogits.ptr else d.best.ptr);
+             return draw.pick(h, o.stream(), o.e.gpa, d, d.best_host[0..4].*, position, sm, false);
+         }
+ 
+         /// Python decode.draft: absorb the kept rows, then chain up to `count` drafts under mtp.Stop, the first kept.
+         pub fn draft(o: Self, d: *Draft, next: []const u32, rows: u64, position: u64, count: usize, sm: ?Sampling, confidence: f64, out: *Chain) !void {
+             out.n = 0;
+-            try o.absorb(d, next, rows, count > 0);
++            const reduced = o.h.draft2 != null and !mtp.isSampled(sm);
++            try o.absorb(d, next, rows, count > 0, reduced);
+             var stop: mtp.Stop = .{ .c = confidence };
+             var j: usize = 0;
+             while (j < @min(count, max_chain)) : (j += 1) {
+-                const got = try o.pick(d, position + j, sm);
++                const got = try o.pick(d, position + j, sm, reduced);
+                 const t = stop.take(j, got.prob);
+                 if (!t.propose) break;
+                 out.tokens[out.n] = got.token;
+@@ -193,14 +195,14 @@ pub fn Ops(comptime Tri: type) type {
+                 out.n += 1;
+                 if (!t.more) break;
+                 if (j + 1 < count) {
+-                    try o.forwardHead(d, &.{got.token}, d.out.ptr, true);
++                    try o.forwardHead(d, &.{got.token}, d.out.ptr, true, reduced);
+                     d.drafted += 1;
+                 }
+             }
+         }
+ 
+         /// forwardHead over several drafts in one pass, a lane each: every row's ops and sums as a lone forwardHead's.
+-        pub fn forwardHeadMany(o: Self, ds: []const *Draft, nexts: []const []const u32, rows: []const u64, scores: bool) !void {
++        pub fn forwardHeadMany(o: Self, ds: []const *Draft, nexts: []const []const u32, rows: []const u64, scores: bool, reduced: bool) !void {
+             const e = o.e;
+             const n_l = ds.len;
+             if (n_l == 0) return;
+@@ -225,7 +227,7 @@ pub fn Ops(comptime Tri: type) type {
+             const n_groups = plan.groups(lane_rows[0..n_l], pl.piece, group_sizes[0..]);
+             var at: usize = 0;
+             for (group_sizes[0..n_groups]) |g| {
+-                try o.headGroup(.{ .ds = ds[at..][0..g], .nexts = nexts[at..][0..g], .rows = rows[at..][0..g], .scores = scores }, s, score_rows);
++                try o.headGroup(.{ .ds = ds[at..][0..g], .nexts = nexts[at..][0..g], .rows = rows[at..][0..g], .scores = scores, .reduced = reduced }, s, score_rows);
+                 at += g;
+             }
+         }
+@@ -431,7 +433,9 @@ pub fn draftMany(o: anytype, ds: []const *Draft, nexts: []const []const u32, row
+             d.drafted = 0;
+         }
+     }
+-    try o.forwardHeadMany(ds, nexts, rows, true);
++    var reduced = h.draft2 != null;
++    for (sms) |sm| reduced = reduced and !mtp.isSampled(sm);
++    try o.forwardHeadMany(ds, nexts, rows, true, reduced);
+     var act: [max_lanes]usize = undefined;
+     var n_act: usize = 0;
+     for (counts, 0..) |c, i| if (c > 0) {
+@@ -448,7 +452,14 @@ pub fn draftMany(o: anytype, ds: []const *Draft, nexts: []const []const u32, row
+     var step_rows: [max_lanes]u64 = undefined;
+     while (n_act > 0 and j < max_chain) : (j += 1) {
+         // every active lane's best draft (fn_row_best on its own scores), then one download of all of them
+-        for (act[0..n_act], 0..) |i, r| try h.best(o.stream(), ds[i].dlogits.ptr, h.ids.len, h.ids.len, 1, ds[0].best.ptr + r * 16);
++        for (act[0..n_act], 0..) |i, r| {
++            const dst = ds[0].best.ptr + r * 16;
++            const src = ds[i].dlogits.ptr;
++            if (reduced) {
++                const st = o.stream();
++                try st.d.check(st.d.api.cuMemcpyDtoDAsync_v2(dst, src, 16, st.handle), "cuMemcpyDtoDAsync");
++            } else try h.best(o.stream(), src, h.ids.len, h.ids.len, 1, dst);
++        }
+         try download(o.stream(), std.mem.sliceAsBytes(best_host[0 .. n_act * 4]), ds[0].best.ptr);
+         var next_act: usize = 0;
+         var n_step: usize = 0;
+@@ -472,7 +483,7 @@ pub fn draftMany(o: anytype, ds: []const *Draft, nexts: []const []const u32, row
+             }
+         }
+         if (n_step > 0) {
+-            try o.forwardHeadMany(step_ds[0..n_step], step_nexts[0..n_step], step_rows[0..n_step], true);
++            try o.forwardHeadMany(step_ds[0..n_step], step_nexts[0..n_step], step_rows[0..n_step], true, reduced);
+             for (step_ds[0..n_step]) |d| d.drafted += 1;
+         }
+         n_act = next_act;
+diff --git a/zig/src/families/flashnext/cuda_mtp_pieces.zig b/zig/src/families/flashnext/cuda_mtp_pieces.zig
+index 68fe6de..615356b 100644
+--- a/zig/src/families/flashnext/cuda_mtp_pieces.zig
++++ b/zig/src/families/flashnext/cuda_mtp_pieces.zig
+@@ -21,6 +21,7 @@ pub fn Piece(comptime O: type, comptime P: type) type {
+         m: usize,
+         last: bool,
+         score: bool,
++        reduced: bool,
+ 
+         pub fn run(r: @This()) !void {
+             const pp = r.p;
+@@ -65,6 +66,7 @@ pub fn Piece(comptime O: type, comptime P: type) type {
+             if (!r.score) return;
+             // the last row's streams and sums are at row 0, where the captured kernels' pointers stay aligned
+             try pp.readout(hh.mixer, 0, 1);
++            if (r.reduced) return pp.copy(r.d.dlogits.ptr, try hh.projectDraft2(pp, 1), 16);
+             try hh.project(pp, ps.mixed, ps.xsm, r.d.dlogits.ptr, 1);
+         }
+     };
+@@ -76,7 +78,8 @@ pub fn runPiece(one: anytype, score_rows: u64) !void {
+     const d = one.d;
+     const s = one.p.s;
+     if (!window_graph.enabled() or d.media != null or e.collective != null) return one.run();
+-    const key: window_graph.HeadKey = .init(d, one.m, one.last, one.score, one.input, s, score_rows);
++    var key: window_graph.HeadKey = .init(d, one.m, one.last, one.score, one.input, s, score_rows);
++    key.reduced = one.reduced;
+     try e.graphs.head.run(e.gpa, e.stream.*, key, one);
+ }
+ 
+@@ -136,6 +139,11 @@ pub fn Group(comptime O: type, comptime P: type, comptime G: type) type {
+             if (!r.group.scores) return;
+             const lanes_n = r.group.ds.len;
+             try pp.readout(hh.mixer, 0, lanes_n);
++            if (r.group.reduced) {
++                const results = try hh.projectDraft2(pp, lanes_n);
++                for (r.group.ds, 0..) |d, i| try pp.copy(d.dlogits.ptr, results + i * 16, 16);
++                return;
++            }
+             const n_ids = hh.ids.len;
+             _ = try pp.lane(ps.mixed, ps.xsm, hh.draft, ps.head_local, ps.dummy, lanes_n, 1);
+             for (r.group.ds, 0..) |d, i| try pp.copy(d.dlogits.ptr, ps.head_local + i * n_ids * 2, n_ids * 2);
+@@ -148,6 +156,7 @@ pub fn runGroup(run: anytype, score_rows: u64) !void {
+     const e = run.o.e;
+     const s = run.p.s;
+     if (!window_graph.enabled() or e.collective != null) return run.run();
+-    const key: window_graph.HeadManyKey = .init(run.group.ds, run.group.nexts, run.group.rows, run.total, run.group.scores, s, score_rows);
++    var key: window_graph.HeadManyKey = .init(run.group.ds, run.group.nexts, run.group.rows, run.total, run.group.scores, s, score_rows);
++    key.reduced = run.group.reduced;
+     try e.graphs.head_many.run(e.gpa, e.stream.*, key, run);
+ }
+diff --git a/zig/src/families/flashnext/cuda_window_graph.zig b/zig/src/families/flashnext/cuda_window_graph.zig
+index a1e0644..ca31163 100644
+--- a/zig/src/families/flashnext/cuda_window_graph.zig
++++ b/zig/src/families/flashnext/cuda_window_graph.zig
+@@ -124,6 +124,7 @@ pub const HeadKey = struct {
+     rows: u32,
+     last: bool,
+     scores: bool,
++    reduced: bool = false,
+     shape: u64,
+     moving: u64,
+ 
+@@ -165,6 +166,7 @@ pub const HeadManyKey = struct {
+     lanes: u32,
+     rows: u32,
+     scores: bool,
++    reduced: bool = false,
+     shape: u64,
+     moving: u64,
+ 

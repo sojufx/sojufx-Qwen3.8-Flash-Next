@@ -40,7 +40,7 @@
      echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | sha256sum -c - && tar -xJf ffmpeg.tar.xz && \
      /tensorfold/tools/zig/build_ffmpeg.sh /opt/ffmpeg /tmp/ffmpeg && \
      mkdir -p /opt/ffmpeg/share/doc/ffmpeg/objects && \
-@@ -195,11 +200,21 @@
+@@ -195,11 +200,25 @@
  # `video` installs libtfvideo.so to native/lib, where the server's dlopen would find it beside the binary; it moves to libexec/tfvideo, off every candidate
  # path, so only VIDEO=1 (start.sh putting that directory on LD_LIBRARY_PATH) makes a server take video at all.
  RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Doptimize=fast -Dffmpeg=/opt/ffmpeg --prefix /opt/tensorfold \
@@ -56,6 +56,10 @@
 +    sha256sum -c /opt/tf-owner-patches/production-zig-sources.sha256 > /tmp/zig-source-check && \
 +    git apply --check /opt/tf-owner-patches/0008-adaptive-depth.patch && \
 +    git apply /opt/tf-owner-patches/0008-adaptive-depth.patch && \
++    git apply --check /opt/tf-owner-patches/0009-draft-head2.patch && \
++    git apply /opt/tf-owner-patches/0009-draft-head2.patch && \
++    /opt/zig/zig fmt zig/src/families/flashnext/cuda_draft2.zig zig/src/families/flashnext/cuda_mtp*.zig zig/src/families/flashnext/cuda_window_graph.zig && \
++    /opt/zig/zig test zig/src/families/flashnext/cuda_draft2.zig --test-filter 'fit retains' && \
 +    /usr/local/cuda/bin/nvcc -O3 -std=c++17 -arch=sm_121 --fatbin head8/head8_complete.cu -o zig/src/families/flashnext/head8.fatbin && \
 +    /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Doptimize=fast --prefix /opt/tensorfold -j2 native && \
 +    mkdir -p /opt/tensorfold/share/build && cp /opt/tf-owner-patches/* /tmp/zig-source-check /opt/tensorfold/share/build/ && \
@@ -63,7 +67,7 @@
  RUN mkdir -p /opt/tensorfold/share/doc/tensorfold && cd /tensorfold && \
      for f in LICENSE LICENSE.md LICENSES NOTICE THIRD_PARTY_NOTICES.md; do \
        if [ -e "$f" ]; then cp -a "$f" /opt/tensorfold/share/doc/tensorfold/ || exit 1; fi; done && \
-@@ -229,6 +244,7 @@
+@@ -229,6 +248,7 @@
  docker run --rm --network none --entrypoint test "$IMAGE" -x /opt/tensorfold/native/bin/tensorfold-native ||
    die "$IMAGE has no tensorfold-native"
  log "Image $IMAGE: tensorfold-native, kernel set present"

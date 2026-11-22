@@ -1,40 +1,41 @@
-# Qwen3.8 Flash-Next FP4 on One DGX Spark: 148 tok/s single, 392 tok/s at 4
+# Qwen3.8 Flash-Next FP4 on One DGX Spark: 149 tok/s single, 397 tok/s at 4
 
 My production setup for `nvidia/Qwen3.8-Flash-Next-FP4-Local` on one NVIDIA DGX Spark (GB10): the native
 [TensorFold](https://github.com/ashhart/TensorFold) v1.2.7 engine with
 [MiaAI-Lab's Flash-Next recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold) (patches 0001 to
-0005), plus my changes: an 8-bit output layer with 16-bit rescoring, and adaptive draft depth for batches of agreeable drafts.
+0005), plus my changes: an 8-bit output layer with 16-bit rescoring, adaptive draft depth for batches of agreeable drafts, and a
+2-bit draft head.
 Full 262K context, FP8 KV cache, images, PDF and video on, 4 concurrent users. One script builds it from public sources: see
 [Install](#install).
 
 ## sparkDash Decode Bench
 
 Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) 1.8.6 `DecodeBench`, running on the Spark itself (no network hop),
-22 November 2026. 400 output tokens per request, temperature 0, thinking off, warmed up first. Aggregate decode tok/s, mean of
+22 November 2026 (with 0009). 400 output tokens per request, temperature 0, thinking off, warmed up first. Aggregate decode tok/s, mean of
 three runs, with the lowest and highest run.
 
 **Code**
 
 | Concurrent requests | Aggregate | Range |
 | ---: | ---: | ---: |
-| 1 | **147.6 tok/s** | 147.4 – 147.8 |
-| 2 | **217.7 tok/s** | 212.2 – 220.5 |
-| 4 | **391.9 tok/s** | 391.3 – 392.4 |
+| 1 | **149.3 tok/s** | 149.1 – 149.6 |
+| 2 | **220.2 tok/s** | 214.7 – 223.0 |
+| 4 | **396.7 tok/s** | 395.5 – 397.5 |
 
 **Prose**
 
 | Concurrent requests | Aggregate | Range |
 | ---: | ---: | ---: |
-| 1 | 65.3 tok/s | 62.9 – 66.5 |
-| 2 | 96.7 tok/s | 93.6 – 98.3 |
-| 4 | 130.7 tok/s | 126.0 – 133.0 |
+| 1 | 66.6 tok/s | 63.7 – 68.2 |
+| 2 | 99.7 tok/s | 96.2 – 101.5 |
+| 4 | 132.3 tok/s | 127.7 – 134.7 |
 
 Code drafts well, so it runs fastest; prose is the harder case. sparkDash's Structured test at 4 requests is left out: it sends
 `ignore_eos`, which forces two of its four counting streams to keep generating junk after they have finished, and that tail
 drafts badly. It measures the prompt, not the engine.
 
-Against my previous build of this repo (TensorFold v1.1.4, 13 November), code went from 122.6 to 147.6 tok/s at one request (+20%)
-and from 239.8 to 391.9 tok/s at four (+63%).
+Against my previous build of this repo (TensorFold v1.1.4, 13 November), code went from 122.6 to 149.3 tok/s at one request (+22%)
+and from 239.8 to 396.7 tok/s at four (+65%).
 
 ## What Is Running
 
@@ -43,11 +44,11 @@ and from 239.8 to 391.9 tok/s at four (+63%).
 | Model | `nvidia/Qwen3.8-Flash-Next-FP4-Local`, revision `b9ce18a6` |
 | Weight overlay | MiaAI's optional `ABLIT=1`: drowzeys/Keys `house-qsa` overlay (attention output weights of 12 layers). The numbers above were measured with it on. |
 | Engine | TensorFold v1.2.7 native (`tensorfold-native serve`), commit `93a2e93e` |
-| Patches | MiaAI-Lab 0001 to 0005, then my 0006 to 0008 in [`patches/`](patches/) (below) |
+| Patches | MiaAI-Lab 0001 to 0005, then my 0006 to 0009 in [`patches/`](patches/) (below) |
 | Context | 262,144 tokens |
 | Concurrency | `--parallel 4` |
 | KV cache | FP8 |
-| Drafting | Built-in MTP head with its 4-bit draft vocabulary head, running-product stop at -0.4, adaptive depth up to 10; copy drafts |
+| Drafting | Built-in MTP head; its draft vocabulary head scanned at 2 bits, top 16 rescored at 4 bits; running-product stop at -0.4; adaptive depth up to 10; copy drafts |
 | n-gram / PLE table | Read from the SSD with `pread` (not RAM-resident) |
 | Vision | Images (up to 50, 16,384 tokens), PDF pages, and video (up to 4, 16,384 tokens) |
 
@@ -55,6 +56,12 @@ Every engine setting is in [`.env.example`](.env.example); `DRY_RUN=1 ./start.sh
 
 ## My Changes On Top Of MiaAI-Lab's Recipe
 
+- **0009, 2-bit draft head (`TF_FLASHNEXT_DRAFT_HEAD2=16`).** Each MTP draft step ends in an output layer over the 79,591
+  most-used tokens, stored at 4 bits (121.5 MiB). At load I fit a 2-bit copy of it (groups of 32 with their own scale and
+  offset, 72.9 MiB extra). A draft step scans the 2-bit copy, keeps its top 16 tokens, and rescores those with the 4-bit rows,
+  so it nearly always proposes what the 4-bit head would. Verification is unchanged, so outputs are identical (10 of 10 greedy
+  replies matched); accepted tokens per round did not drop. Every sparkDash cell went up 0.8% to 2.8%. The idea comes from
+  Hibana's draft-only head; a top-8 shortlist gained less.
 - **0008, adaptive draft depth (`TF_FLASHNEXT_ADAPTIVE_DEPTH=1`, max 10, cost 0.10).** Each greedy request keeps a running
   estimate of how often its drafts are accepted. When two or more requests are drafting together and one of them accepts at
   least 95% of its drafts (typical for code), it may draft deeper than the normal cap of 8, up to 10, if a simple cost model says
@@ -88,7 +95,7 @@ cp .env.example .env       # set HF_CACHE and KERNEL_CACHE; ABLIT=1 is the overl
 `build.sh` fetches MiaAI-Lab's recipe at commit `b956dba` into `.recipe/`, applies [`patches/recipe-owner.patch`](patches/recipe-owner.patch)
 to it, and runs its `scripts/prepare.sh`. That builds TensorFold v1.2.7 with MiaAI's patches 0001 to 0005 from source on a pinned
 NVIDIA PyTorch 26.07 base image, then applies 0006 and 0007, checks every engine source file against the SHA256 list of the build
-that produced the numbers above (`patches/production-zig-sources.sha256`), applies 0008, and compiles. No prebuilt engine or
+that produced the numbers above (`patches/production-zig-sources.sha256`), applies 0008 and 0009, and compiles. No prebuilt engine or
 private image is used. The build uses two CPU jobs, so expect it to take a while.
 
 `start.sh` copies your `.env` into `.recipe/` and runs MiaAI's `start.sh`, which also takes `restart` and extra
@@ -111,7 +118,8 @@ The previous vLLM + TokenV3 recipe (`Mia-AiLab/Qwen3.8-Flash-Next-NVFP4`, MTP K=
   32-row copy drafts (outcastofmusic).
 - [MiaAI-Lab](https://github.com/MiaAI-Lab): the Flash-Next TensorFold recipe, patches 0001 to 0005, video and PDF support, model
   preparation, and sparkDash.
-- [Hibana](https://github.com/sharar-project/hibana): the acceptance-driven draft depth idea behind 0008 (no code reused).
+- [Hibana](https://github.com/sharar-project/hibana): the ideas behind 0008 (acceptance-driven draft depth) and 0009 (low-bit
+  draft head with rescoring); no code reused.
 - NVIDIA: the Qwen3.8-Flash-Next FP4-Local checkpoint. drowzeys/Keys: the optional house-qsa overlay.
 
 Full list in [`CREDITS`](CREDITS) and [`NOTICE`](NOTICE). The patches, `build.sh`, `start.sh` and `.env.example` are MIT, like the

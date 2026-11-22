@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # Builds the image from public sources: MiaAI-Lab's recipe at a pinned commit (TensorFold v1.2.7 + MiaAI 0001-0005),
-# then my patches 0006-0008 from patches/. With IMAGE_ONLY=0 it also downloads the pinned weights.
+# then my patches 0006-0009 from patches/. With IMAGE_ONLY=0 it also downloads the pinned weights.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)
 RECIPE_COMMIT=b956dba8a468f1cf376d60bbbd9b9ed51ff2f0a9
@@ -22,7 +22,7 @@ git -C "$RECIPE_DIR" clean -qfdx -e .env
 # against the production manifest), two CPU jobs, an FFmpeg mirror, and an image-only mode.
 git -C "$RECIPE_DIR" apply "$ROOT/patches/recipe-owner.patch"
 mkdir -p "$RECIPE_DIR/owner-patches"
-cp "$ROOT"/patches/000[678]-*.patch "$ROOT/patches/production-zig-sources.sha256" "$RECIPE_DIR/owner-patches/"
+cp "$ROOT"/patches/000[6789]-*.patch "$ROOT/patches/production-zig-sources.sha256" "$RECIPE_DIR/owner-patches/"
 cp "$env_file" "$RECIPE_DIR/.env"
 
 cd "$RECIPE_DIR"
