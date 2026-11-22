@@ -1,0 +1,70 @@
+diff --git a/zig/src/core/lanes/copy_log.zig b/zig/src/core/lanes/copy_log.zig
+new file mode 100644
+index 000000000..5cd60eedf
+--- /dev/null
++++ b/zig/src/core/lanes/copy_log.zig
+@@ -0,0 +1,44 @@
++const std = @import("std");
++const Kind = @import("windows.zig").Kind;
++const kinds = std.enums.values(Kind);
++
++pub const Log = struct {
++    mode: ?u8 = null,
++    calls: usize = 0,
++    detailed: usize = 0,
++    counts: [kinds.len]Counts = @splat(.{}),
++
++    const Counts = struct {
++        windows: u64 = 0,
++        rows: u64 = 0,
++        kept: u64 = 0,
++        full: u64 = 0,
++    };
++
++    pub fn record(log: *Log, kind: Kind, rows: usize, kept: usize) void {
++        const mode = log.mode orelse blk: {
++            const value = if (std.c.getenv("TF_FLASHNEXT_COPY_LOG")) |text| text[0] else 0;
++            log.mode = value;
++            break :blk value;
++        };
++        if (mode != '1' and mode != '2') return;
++        if (mode == '2' and kind == .copy and log.detailed < 1200) {
++            std.debug.print("COPYDETAIL rows={d} kept={d}\n", .{ rows, kept });
++            log.detailed += 1;
++        }
++        const count = &log.counts[@intFromEnum(kind)];
++        count.windows += 1;
++        count.rows += rows;
++        count.kept += kept;
++        if (rows > 1 and kept == rows - 1) count.full += 1;
++        log.calls += 1;
++        if (log.calls < 400) return;
++        std.debug.print("COPYLOG", .{});
++        for (kinds, log.counts) |tag, total| if (total.windows > 0) {
++            std.debug.print(" {s}: win={d} rows={d} kept={d} full={d};", .{ @tagName(tag), total.windows, total.rows, total.kept, total.full });
++        };
++        std.debug.print("\n", .{});
++        log.calls = 0;
++        log.counts = @splat(.{});
++    }
++};
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 018ae4a72..266d9bac8 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -45,6 +45,7 @@ pub const Engine = struct {
+     drafted: u64 = 0,
+     accepted: u64 = 0,
+     shared_rounds: u64 = 0,
++    copy_log: @import("copy_log.zig").Log = .{},
+     late: @import("late_draft.zig").State = .{},
+     alone: bool = true, // this step has one live stream: its copies may take their ramp
+     lone_kept: [2][lone_costs.bands]?lone_costs.Kept = @splat(@splat(null)), // the newest lone calibrations, greedy then sampled, a band each
+@@ -340,6 +341,7 @@ pub const Engine = struct {
+             for (path[1..]) |r| try committed.append(a, accept.targetPick(sampled, parents, r));
+             try committed.append(a, sampled[path[path.len - 1]]);
+             if (s.proposer) |pr| pr.round(@intCast(rows), @intCast(path.len - 1));
++            e.copy_log.record(p.kind, rows, path.len - 1);
+             if (rows > 1) {
+                 const kept = path.len - 1;
+                 e.drafted += rows - 1;

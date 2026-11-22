@@ -1,0 +1,178 @@
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -89,6 +89,7 @@
+         own.head = try mtp.Head.init(gpa, io, driver, &own.stream, dir);
+         own.depth = @max(1, @min(mtp.max_chain, F.envUsize("TF_FLASHNEXT_DRAFTS", mtp.default_depth)));
+         own.depth_greedy = @max(1, @min(mtp.max_chain, F.envUsize("TF_FLASHNEXT_DRAFTS_GREEDY", mtp.default_depth_greedy)));
++        if (o.tp == 1) own.adaptive = @import("cuda_lanes_draft.zig").Adaptive.load(F);
+         if (std.c.getenv("TF_FLASHNEXT_CONFIDENCE")) |v| own.confidence = std.fmt.parseFloat(f64, std.mem.span(v)) catch mtp.default_confidence;
+     }
+     errdefer if (own.head) |h| h.deinit();
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -167,6 +167,7 @@
+             head: ?*mtp.Head = null,
+             depth: usize = mtp.default_depth,
+             depth_greedy: usize = mtp.default_depth_greedy,
++            adaptive: ?lanes_draft.Adaptive = null,
+             confidence: f64 = mtp.default_confidence,
+             /// A captured Triton set (TENSORFOLD_CUDA_KERNELS) for comparison, else null: our own glue.
+             set: ?cuda.aot.Set = null,
+@@ -241,7 +242,7 @@
+                     .mtp = drafting,
+                     .speculate = drafting,
+                     .speculate_early = false,
+-                    .drafts = if (drafting) @intCast(@max(self.depth, self.depth_greedy)) else 0,
++                    .drafts = if (drafting) @intCast(@max(self.depth, self.depth_greedy, if (self.adaptive) |cfg| cfg.max else 0)) else 0,
+                     .draft_probabilities = drafting,
+                     .streams_exact = true,
+                     .hidden_rows = true,
+--- a/zig/src/families/flashnext/cuda_lanes_draft.zig
++++ b/zig/src/families/flashnext/cuda_lanes_draft.zig
+@@ -26,6 +26,38 @@
+ pub const Rule = struct { greedy: usize, greedy_stop: f64 };
+ pub const shared_stop: f64 = 0.6;
+ 
++pub const Adaptive = struct {
++    max: usize,
++    cost: f64,
++
++    pub fn load(comptime F: type) ?Adaptive {
++        const flag = std.c.getenv("TF_FLASHNEXT_ADAPTIVE_DEPTH") orelse return null;
++        if (!std.mem.eql(u8, std.mem.span(flag), "1")) return null;
++        const raw = if (std.c.getenv("TF_FLASHNEXT_ADAPTIVE_COST")) |value|
++            std.fmt.parseFloat(f64, std.mem.span(value)) catch 0.1
++        else
++            0.1;
++        return .{
++            .max = std.math.clamp(F.envUsize("TF_FLASHNEXT_ADAPTIVE_MAX", mtp.default_depth_greedy), 1, mtp.max_chain),
++            .cost = if (raw > 0 and std.math.isFinite(raw)) raw else 0.1,
++        };
++    }
++};
++
++pub fn countFor(self: anytype, rules: Rule, request: be.DraftRequest, width: usize) usize {
++    const fallback = @min(request.depth, mtp.depthFor(request.stream.sampling, self.depth, rules.greedy));
++    const cfg = self.adaptive orelse return fallback;
++    const stream = request.stream;
++    if (mtp.isSampled(stream.sampling) or stream.grammar != null or stream.logprobs != null or stream.prompt_logprobs != null) return fallback;
++    const maximum = @min(request.depth, cfg.max);
++    if (maximum <= fallback or width < 2) return fallback;
++    if (stream.depth) |*state| {
++        if (state.chain_rate == null) state.chain_rate = .{};
++        return state.chain_rate.?.raised(fallback, maximum, cfg.cost);
++    }
++    return fallback;
++}
++
+ pub fn rule(self: anytype, width: usize) Rule {
+     const greedy = if (width <= wideStreams()) self.depth_greedy else @min(self.depth_greedy, mtp.default_depth);
+     const stop = if (sharedRule() and busy(&self.lanes)) shared_stop else self.confidence;
+@@ -91,7 +123,7 @@
+         }
+         if (r.position != l.seq.fed + 1) return error.PositionMismatch;
+         const room = l.seq.cap - l.seq.fed - 1;
+-        counts[n] = @min(@min(r.depth, mtp.depthFor(r.stream.sampling, self.depth, rl.greedy)), room);
++        counts[n] = room;
+         if (r.rows) |path| {
+             nexts[n] = r.follow[0..path.len];
+             rows[n] = d.streams.ptr;
+@@ -112,6 +144,9 @@
+         // one stream: it drafts alone below (its rollback is idempotent)
+         return;
+     }
++    for (which[0..n], counts[0..n]) |ri, *count| {
++        count.* = @min(countFor(self, rl, requests[ri], n), count.*);
++    }
+     try self.ops().draftMany(ds[0..n], nexts[0..n], rows[0..n], counts[0..n], positions[0..n], sms[0..n], stops[0..n], outs[0..n]);
+     for (which[0..n]) |ri| done[ri] = true;
+ }
+--- a/zig/src/core/lanes/depth.zig
++++ b/zig/src/core/lanes/depth.zig
+@@ -13,6 +13,7 @@
+ /// A stream's acceptance by depth and probe counters (Python `_depth_state[stream]`).
+ pub const State = struct {
+     p: []f64,
++    chain_rate: ?ChainRate = null,
+     rounds: u64 = 0,
+     plain: ?u64 = null,
+     wait: ?u64 = null,
+@@ -21,7 +22,41 @@
+     pub fn deinit(st: *State, gpa: Allocator) void {
+         gpa.free(st.p);
+         if (st.ms) |*t| t.deinit(gpa);
++    }
++};
++
++pub const ChainRate = struct {
++    landed: f64 = 3.4,
++    tested: f64 = 4,
++
++    pub fn observe(rate: *ChainRate, proposed: usize, accepted: usize) void {
++        if (proposed == 0) return;
++        rate.landed = 0.85 * rate.landed + @as(f64, @floatFromInt(accepted));
++        rate.tested = 0.85 * rate.tested + @as(f64, @floatFromInt(@min(proposed, accepted + 1)));
++    }
++
++    pub fn best(rate: ChainRate, maximum: usize, cost: f64) usize {
++        const probability = rate.landed / rate.tested;
++        var depth: usize = 0;
++        var reach: f64 = 1;
++        var expected: f64 = 1;
++        var best_rate: f64 = 0;
++        for (0..maximum) |index| {
++            reach *= probability;
++            expected += reach;
++            const score = expected / (1 + cost * @as(f64, @floatFromInt(index)));
++            if (score > best_rate) {
++                depth = index + 1;
++                best_rate = score;
++            }
++        }
++        return depth;
+     }
++
++    pub fn raised(rate: ChainRate, floor: usize, maximum: usize, cost: f64) usize {
++        if (maximum <= floor or rate.landed < 0.95 * rate.tested) return floor;
++        return @max(floor, rate.best(maximum, cost));
++    }
+ };
+ 
+ /// What the rule reads of a stream when it decides.
+@@ -90,6 +125,7 @@
+     /// Draft j was tried when drafts 1 .. j - 1 were kept; its estimate moves toward whether it was kept.
+     pub fn observeDepth(r: *Rule, who: Who, proposed: i64, accepted: i64) !void {
+         const p = try r.rates(who);
++        if (who.state.*.?.chain_rate) |*rate| if (proposed > 0) rate.observe(@intCast(proposed), @intCast(accepted));
+         const n = @min(@max(proposed, 0), @as(i64, @intCast(p.len)));
+         var j: i64 = 0;
+         while (j < n) : (j += 1) {
+@@ -426,6 +462,28 @@
+         try list.append(r.gpa, .{ .streams = streams, .ms = fixed, .head = head });
+     }
+ };
++
++test "adaptive chains price conditional acceptance and respect the cap" {
++    var good: ChainRate = .{};
++    var poor: ChainRate = .{};
++    for (0..20) |_| {
++        good.observe(6, 6);
++        poor.observe(6, 0);
++    }
++    try std.testing.expectEqual(@as(usize, 8), good.best(8, 0.1));
++    try std.testing.expectEqual(@as(usize, 6), good.best(6, 0.1));
++    try std.testing.expectEqual(@as(usize, 1), poor.best(8, 0.1));
++    try std.testing.expectEqual(@as(usize, 0), good.best(0, 0.1));
++    try std.testing.expectEqual(@as(usize, 9), good.raised(8, 9, 0.14));
++    try std.testing.expectEqual(@as(usize, 8), good.raised(8, 7, 0.14));
++    try std.testing.expectEqual(@as(usize, 8), poor.raised(8, 9, 0.14));
++    try std.testing.expectEqual(@as(usize, 8), (ChainRate{}).raised(8, 9, 0.14));
++    var censored: ChainRate = .{};
++    var short: ChainRate = .{};
++    censored.observe(8, 1);
++    short.observe(2, 1);
++    try std.testing.expectEqual(short, censored);
++}
+ 
+ fn distance(a: u32, b: usize) usize {
+     const x: usize = a;

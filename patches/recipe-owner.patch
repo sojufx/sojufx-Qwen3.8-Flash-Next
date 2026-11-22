@@ -1,0 +1,73 @@
+--- a/scripts/config.sh
++++ b/scripts/config.sh
+@@ -94,6 +94,7 @@
+     cat patches/*.patch 2>/dev/null
+     sed -n "/<<'DOCKERFILE'/,/^DOCKERFILE\$/p" scripts/prepare.sh
+     echo "$TF_REPO $TF_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE jpeg-$LIBJPEG_TURBO_VERSION-$LIBJPEG_TURBO_SHA256 webp-$LIBWEBP_VERSION-$LIBWEBP_SHA256 pdfium-$PYPDFIUM2_VERSION-$PYPDFIUM2_AARCH64_SHA256 ffmpeg-$FFMPEG_VERSION-$FFMPEG_SHA256 grammar-$TF_RELEASE_VERSION-$TF_RELEASE_AARCH64_SHA256"
++    if [[ -d owner-patches ]]; then sha256sum owner-patches/*; fi
+   ) | sha256sum | cut -c1-12
+ }
+ GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold}"
+--- a/scripts/prepare.sh
++++ b/scripts/prepare.sh
+@@ -70,7 +70,10 @@
+ 
+ DOCKER_ROOT=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)
+ rev=$(snapshot_rev)
+-if missing=$(hub_missing_gb); then
++if [[ "${IMAGE_ONLY:-0}" == 1 ]]; then
++  need_ckpt=0
++  ckpt_what="image only"
++elif missing=$(hub_missing_gb); then
+   need_ckpt=0; (( missing == 0 )) || need_ckpt=$((missing + 5))
+   ckpt_what="the download needs ~${missing} GB that the cache does not hold yet"
+ else
+@@ -108,6 +111,8 @@
+   trap 'rm -rf -- "$ctx"' EXIT
+   mkdir -p "$ctx/patches"
+   compgen -G 'patches/*.patch' >/dev/null && cp -- patches/*.patch "$ctx/patches/"
++  mkdir -p "$ctx/owner-patches"
++  if [[ -d owner-patches ]]; then cp -- owner-patches/* "$ctx/owner-patches/"; fi
+   nocache=(); [[ $REBUILD -eq 1 ]] && nocache=(--no-cache)
+   docker build ${DOCKER_BUILD_ARGS:-} "${nocache[@]}" -t "$IMAGE" --build-arg BASE_IMAGE="$BASE_IMAGE" \
+     --build-arg TF_REPO="$TF_REPO" --build-arg TF_REF="$TF_REF" \
+@@ -184,7 +189,7 @@
+ ARG FFMPEG_VERSION
+ ARG FFMPEG_SHA256
+ RUN mkdir -p /tmp/ffmpeg && cd /tmp/ffmpeg && \
+-    curl -fsSL -o ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" && \
++    curl -fsSL --connect-timeout 10 -o ffmpeg.tar.xz "https://distfiles.macports.org/ffmpeg/ffmpeg-${FFMPEG_VERSION}.tar.xz" && \
+     echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | sha256sum -c - && tar -xJf ffmpeg.tar.xz && \
+     /tensorfold/tools/zig/build_ffmpeg.sh /opt/ffmpeg /tmp/ffmpeg && \
+     mkdir -p /opt/ffmpeg/share/doc/ffmpeg/objects && \
+@@ -195,11 +200,21 @@
+ # `video` installs libtfvideo.so to native/lib, where the server's dlopen would find it beside the binary; it moves to libexec/tfvideo, off every candidate
+ # path, so only VIDEO=1 (start.sh putting that directory on LD_LIBRARY_PATH) makes a server take video at all.
+ RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Doptimize=fast -Dffmpeg=/opt/ffmpeg --prefix /opt/tensorfold \
+-      -j"$(nproc)" fatbins native video && \
++      -j2 fatbins native video && \
+     test -x /opt/tensorfold/native/bin/tensorfold-native && test -s /opt/tensorfold/native/lib/libtfvideo.so && \
+     mkdir -p /opt/tensorfold/libexec/tfvideo && \
+     mv /opt/tensorfold/native/lib/libtfvideo.so /opt/tensorfold/libexec/tfvideo/libtfvideo.so && \
+     test ! -e /opt/tensorfold/native/lib/libtfvideo.so
++COPY owner-patches /opt/tf-owner-patches
++RUN cd /tensorfold && if [ -e /opt/tf-owner-patches/0007-head8.patch ]; then \
++    for p in /opt/tf-owner-patches/000[67]-*.patch; do git apply --check "$p" && git apply "$p" || exit 1; done && \
++    sha256sum -c /opt/tf-owner-patches/production-zig-sources.sha256 > /tmp/zig-source-check && \
++    git apply --check /opt/tf-owner-patches/0008-adaptive-depth.patch && \
++    git apply /opt/tf-owner-patches/0008-adaptive-depth.patch && \
++    /usr/local/cuda/bin/nvcc -O3 -std=c++17 -arch=sm_121 --fatbin head8/head8_complete.cu -o zig/src/families/flashnext/head8.fatbin && \
++    /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Doptimize=fast --prefix /opt/tensorfold -j2 native && \
++    mkdir -p /opt/tensorfold/share/build && cp /opt/tf-owner-patches/* /tmp/zig-source-check /opt/tensorfold/share/build/ && \
++    sha256sum zig/src/families/flashnext/head8.fatbin /opt/tensorfold/native/bin/tensorfold-native > /opt/tensorfold/share/build/binaries.sha256; fi
+ RUN mkdir -p /opt/tensorfold/share/doc/tensorfold && cd /tensorfold && \
+     for f in LICENSE LICENSE.md LICENSES NOTICE THIRD_PARTY_NOTICES.md; do \
+       if [ -e "$f" ]; then cp -a "$f" /opt/tensorfold/share/doc/tensorfold/ || exit 1; fi; done && \
+@@ -229,6 +244,7 @@
+ docker run --rm --network none --entrypoint test "$IMAGE" -x /opt/tensorfold/native/bin/tensorfold-native ||
+   die "$IMAGE has no tensorfold-native"
+ log "Image $IMAGE: tensorfold-native, kernel set present"
++[[ "${IMAGE_ONLY:-0}" != 1 ]] || exit 0
+ 
+ command -v hf >/dev/null || warn "host 'hf' CLI not found, downloading from inside the container"
+ download() {   # download <repo> [revision] [include pattern]

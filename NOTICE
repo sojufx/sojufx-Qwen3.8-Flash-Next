@@ -1,6 +1,6 @@
 TensorFold production recipe
 
-The new build.sh, start.sh, Dockerfile and patches/ are MIT-licensed.
+The build.sh, start.sh, .env.example and patches/ are MIT-licensed.
 The repository LICENSE and archived vllm/ retain their existing license.
 
 MIT License

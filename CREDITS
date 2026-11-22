@@ -1,13 +1,9 @@
-TensorFold: https://github.com/ashhart/TensorFold (MIT), v1.1.4 commit eab8582819688325e371907e4706e1c602b8a273.
-MiaAI-Lab: https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold (MIT), recipe commit 20e15e41f2f514a0d287710f4665ee1b5009ba41; public patches 0001–0017, launch/model preparation and sparkDash.
-Robert Wojciechowski and TensorFold authors: shared-prefix admission wait, upstream 6588b5a1e535e72013a3178fd33522ecf30fae76, backported as local 0018.
-outcastofmusic and TensorFold authors: copy32, upstream 5bb64597d76c433745ac4d55a09b306626e3089b and a0b0eb151a4cd4b955a08a47745c6627e62c145c, backported as local 0019.
-sojufx: local COPY_LOG=2 diagnostics (0020), FP8 shortlist/BF16 tile-rescoring head and integration (0021), build/launch recipe (MIT). Head8 projection and fragment code derives from TensorFold's MIT kernels.
+TensorFold: https://github.com/ashhart/TensorFold (MIT), v1.2.7 commit 93a2e93ecebff8aa52b88e58c5dd222516e69c5f.
+MiaAI-Lab: https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold (MIT), recipe commit b956dba8a468f1cf376d60bbbd9b9ed51ff2f0a9; patches 0001-0005, launch/model preparation, video and PDF support, and sparkDash.
+Prefix wait (Robert Wojciechowski) and 32-row copy drafts (outcastofmusic), which I backported to v1.1.4 earlier, are now part of upstream TensorFold v1.2.7.
+sojufx: copy-draft diagnostics (0006), FP8 shortlist/BF16 tile-rescoring output head (0007), raise-only adaptive MTP draft depth (0008), and the build/launch recipe (MIT). Head8 projection and fragment code derives from TensorFold's MIT kernels. The adaptive-depth cost model follows the idea described in the Hibana engine's documentation (https://github.com/sharar-project/hibana, Apache-2.0); no Hibana code is used.
 drowzeys / Keys: optional house-qsa overlay, revision c44f5b92ee3d307b82aab1c55f4cc4ae1d440344. Overlay weights retain their own model-card license and gated Responsible Use Agreement; they are not distributed here.
 NVIDIA: stock FP4-Local weights, revision b9ce18a6887e18c089fdea8509a33e63429a3300. Model weights and NVIDIA container retain their own terms; MIT applies to recipe/patch code.
-
-The pinned MiaAI 0013 already includes the formerly separate local 0019 failed-pread fix. It must not be applied twice. The experimental copy-draft-settings patch is absent from the preserved production source hashes: prefix-wait was rebuilt from public 0001–0017, not layered on copy0018.
-Production's runtime image does not contain /tensorfold. Compare engine sources with the preserved final-builder manifest, and verify that manifest's binary SHA256 against the live runtime before claiming equivalence. New head8 CUDA build inputs are preserved in /tensorfold/head8; exclude them only when comparing the historical zig/ engine-source manifest.
 
 Inherited MiaAI credits:
 

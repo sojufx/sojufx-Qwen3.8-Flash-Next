@@ -1,10 +1,6 @@
-Subject: Opt-in FP8 output-head shortlist with BF16 tile rescoring
-Origin: sojufx implementation; device projection/fragment code derived from TensorFold.
-License: MIT (2026 TensorFold contributors and sojufx).
-
 diff --git a/head8/head8_complete.cu b/head8/head8_complete.cu
 new file mode 100644
-index 0000000..9f2db8a
+index 000000000..9f2db8a97
 --- /dev/null
 +++ b/head8/head8_complete.cu
 @@ -0,0 +1,49 @@
@@ -59,7 +55,7 @@ index 0000000..9f2db8a
 +}
 diff --git a/head8/head8_ops.cuh b/head8/head8_ops.cuh
 new file mode 100644
-index 0000000..eb695d8
+index 000000000..eb695d8cc
 --- /dev/null
 +++ b/head8/head8_ops.cuh
 @@ -0,0 +1,302 @@
@@ -367,7 +363,7 @@ index 0000000..eb695d8
 +}
 diff --git a/head8/head8_prepare.cuh b/head8/head8_prepare.cuh
 new file mode 100644
-index 0000000..ff3aca5
+index 000000000..ff3aca5ab
 --- /dev/null
 +++ b/head8/head8_prepare.cuh
 @@ -0,0 +1,20 @@
@@ -393,7 +389,7 @@ index 0000000..ff3aca5
 +}
 diff --git a/head8/qmm_frag.cuh b/head8/qmm_frag.cuh
 new file mode 100644
-index 0000000..be44121
+index 000000000..be441212d
 --- /dev/null
 +++ b/head8/qmm_frag.cuh
 @@ -0,0 +1,109 @@
@@ -507,15 +503,15 @@ index 0000000..be44121
 +
 +} // namespace qmm_frag
 diff --git a/zig/src/families/flashnext/cuda_batch_head.zig b/zig/src/families/flashnext/cuda_batch_head.zig
-index c33fe9b..f4e89df 100644
+index a20a788bb..8a8bf1e84 100644
 --- a/zig/src/families/flashnext/cuda_batch_head.zig
 +++ b/zig/src/families/flashnext/cuda_batch_head.zig
-@@ -77,6 +77,15 @@ pub fn head(self: anytype, logits_host: ?[]u8) !void {
+@@ -78,6 +78,15 @@ pub fn head(self: anytype, logits_host: ?[]u8) !void {
  /// Column tiles keep their own reduction order; each gathered row restores global vocabulary order.
  pub fn projectHead(self: anytype, out: u64, n: usize) !void {
      const s = self.s;
 +    if (self.m.head8) |h| {
-+        if (!self.prompt and try h.run(self.stream, s.mixed, self.m.head.w.ptr, out, n)) {
++        if (!self.hooks.prompt and try h.run(self.stream, s.mixed, self.m.head.w.ptr, out, n)) {
 +            if (h.auditing) {
 +                _ = try self.lane(s.mixed, s.xsm, self.m.head, h.audit.ptr, s.dummy, n, 1);
 +                try h.compareRows(self.stream, out, n);
@@ -527,10 +523,10 @@ index c33fe9b..f4e89df 100644
          _ = try self.lane(s.mixed, s.xsm, self.m.head, out, s.dummy, n, 1);
          return;
 diff --git a/zig/src/families/flashnext/cuda_batch_state.zig b/zig/src/families/flashnext/cuda_batch_state.zig
-index 0a6c9a4..84d734a 100644
+index 3c06ccc59..1e8d97ab5 100644
 --- a/zig/src/families/flashnext/cuda_batch_state.zig
 +++ b/zig/src/families/flashnext/cuda_batch_state.zig
-@@ -584,6 +584,7 @@ pub const Model = struct {
+@@ -550,6 +550,7 @@ pub const Model = struct {
      layers: []const Layer,
      mixer: HcW,
      head: Q4,
@@ -540,10 +536,10 @@ index 0a6c9a4..84d734a 100644
      pocket: ?MoeAdd = null,
 diff --git a/zig/src/families/flashnext/cuda_head8.zig b/zig/src/families/flashnext/cuda_head8.zig
 new file mode 100644
-index 0000000..bfc9eb2
+index 000000000..af5215d09
 --- /dev/null
 +++ b/zig/src/families/flashnext/cuda_head8.zig
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,120 @@
 +//! Opt-in FP8 shortlist and exact BF16 tile rescoring for unconstrained greedy main heads.
 +const std = @import("std");
 +const cuda = @import("cuda");
@@ -552,6 +548,7 @@ index 0000000..bfc9eb2
 +const K = 2560;
 +const cap = 64;
 +const blocks = 243;
++pub const max_rows = 16;
 +const image align(8) = @embedFile("head8.fatbin").*;
 +
 +pub fn enabled() bool {
@@ -641,7 +638,7 @@ index 0000000..bfc9eb2
 +        try launch(f, s, &a, if (tiles != 0) 64 else ((n + 15) / 16) * (N / 64), 1, 128, if (tiles != 0) 40960 else 24576);
 +    }
 +    pub fn run(h: *Head, s: cuda.Stream, x: u64, bf16: u64, out: u64, n: usize) !bool {
-+        if (n > 16) return false;
++        if (n > max_rows) return false;
 +        try h.projection(s, h.fp8, x, h.codes.ptr, h.scales.ptr, h.tmp.ptr, n, 0);
 +        var a: cuda.Args = .{};
 +        a.add(h.tmp.ptr); a.add(h.vals.ptr); a.add(h.ids.ptr); a.add(@as(c_int, @intCast(n)));
@@ -664,10 +661,10 @@ index 0000000..bfc9eb2
 +    }
 +};
 diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
-index 80c65ab..775c5bd 100644
+index d3fb067f4..7424b50cd 100644
 --- a/zig/src/families/flashnext/cuda_lanes.zig
 +++ b/zig/src/families/flashnext/cuda_lanes.zig
-@@ -453,6 +453,11 @@ pub fn Namespace(comptime Tri: type) type {
+@@ -466,6 +466,11 @@ pub fn Namespace(comptime Tri: type) type {
          /// A drafting stream's window in one batched pass; streams without drafts share rounds, each row its own bits.
          fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
              const self = of(ptr);
@@ -680,10 +677,10 @@ index 80c65ab..775c5bd 100644
              defer self.gpa.free(seqs);
              const ids = try self.gpa.alloc(u32, windows.len);
 diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
-index 10600a8..9a0ccbb 100644
+index 0f64844ec..33610c771 100644
 --- a/zig/src/families/flashnext/cuda_prompt.zig
 +++ b/zig/src/families/flashnext/cuda_prompt.zig
-@@ -136,6 +136,8 @@ pub const Engine = struct {
+@@ -111,6 +111,8 @@ pub const Engine = struct {
      table: embed.Table,
      mixer: HcW,
      head_q: Q4,
@@ -692,16 +689,16 @@ index 10600a8..9a0ccbb 100644
      eos: i64,
      layers: [layers_n]Layer,
      n_layers: usize,
-@@ -181,6 +183,8 @@ pub const Engine = struct {
-         e.image_factory = null;
+@@ -159,6 +161,8 @@ pub const Engine = struct {
          e.round_graph = .{};
+         e.graphs = .{};
          e.kv = .bf16;
 +        e.head8 = null;
 +        e.head8_allowed = false;
          errdefer for (e.layers[0..e.n_layers]) |*l| l.free(gpa);
          e.model_dir = try gpa.dupe(u8, model_dir);
          errdefer gpa.free(e.model_dir);
-@@ -214,6 +218,11 @@ pub const Engine = struct {
+@@ -192,6 +196,11 @@ pub const Engine = struct {
              e.head_q = try uploadQ4(gpa, driver, head_w.w, head_w.s, head_w.b, vocab, dims / 8);
          }
          errdefer e.head_q.free();
@@ -709,24 +706,88 @@ index 10600a8..9a0ccbb 100644
 +            if (world != 1) return error.BadHeadSharding;
 +            e.head8 = try @import("cuda_head8.zig").Head.init(driver, stream.*, head_tensor);
 +        }
-+        errdefer if (e.head8) |*h| h.deinit();
++        errdefer if (e.head8) |*head8| head8.deinit();
          var pack_mod = try cuda.Module.load(driver, cuda.kernels.experts_pack);
          defer pack_mod.unload();
          const pack_fn = try pack_mod.function(weights.pack_symbol);
-@@ -253,6 +262,7 @@ pub const Engine = struct {
+@@ -234,6 +243,7 @@ pub const Engine = struct {
          e.batch_k.deinit();
          e.ngram.deinit();
          for (e.layers[0..e.n_layers]) |*l| l.free(e.gpa);
-+        if (e.head8) |*h| h.deinit();
++        if (e.head8) |*head8| head8.deinit();
          e.head_q.free();
          e.mixer.free();
          e.table.deinit();
-@@ -292,7 +302,7 @@ pub const Engine = struct {
+@@ -273,7 +283,7 @@ pub const Engine = struct {
      /// The resident weights a pass reads, with the taught layers' pockets.
      pub fn model(e: *Engine) batch.Model {
          const m = e.pockets.mask();
 -        return .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .table_dense = e.table.dense, .collective = e.collective, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .ngram = &e.ngram, .pocket = if (m != 0) .{ .ctx = e, .add = servePocket, .layers = m } else null };
-+        return .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .table_dense = e.table.dense, .collective = e.collective, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .head8 = if (e.head8_allowed) (if (e.head8) |*h| h else null) else null, .ngram = &e.ngram, .pocket = if (m != 0) .{ .ctx = e, .add = servePocket, .layers = m } else null };
++        return .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .table_dense = e.table.dense, .collective = e.collective, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .head8 = if (e.head8_allowed) (if (e.head8) |*head8| head8 else null) else null, .ngram = &e.ngram, .pocket = if (m != 0) .{ .ctx = e, .add = servePocket, .layers = m } else null };
      }
  
      /// The weights a pass of streams that read the model as shipped reads (untaught): the pockets left out.
+diff --git a/zig/src/families/flashnext/cuda_prompt_windows.zig b/zig/src/families/flashnext/cuda_prompt_windows.zig
+index 601bfbd45..11a9334df 100644
+--- a/zig/src/families/flashnext/cuda_prompt_windows.zig
++++ b/zig/src/families/flashnext/cuda_prompt_windows.zig
+@@ -6,6 +6,7 @@ const batch = prompt.batch;
+ const pocket = @import("cuda_pocket.zig");
+ const vocab = @import("cuda_prompt_wt.zig").vocab;
+ const window_graph = @import("cuda_window_graph.zig");
++const head8 = @import("cuda_head8.zig");
+ const Engine = prompt.Engine;
+ const Seq = prompt.Seq;
+ 
+@@ -13,7 +14,9 @@ const Seq = prompt.Seq;
+ pub fn forwardGraph(e: *Engine, comptime Tri: type, p: *batch.Pass(Tri), seq: *Seq, ids: []const u32, hooks: batch.Hooks) !bool {
+     if (!window_graph.enabled() or hooks.logits != .all or hooks.host_logits or hooks.moe_add != null) return false;
+     if (ids.len > @import("cuda_mtp.zig").max_rows or ids.len > p.s.cap or e.collective != null or seq.media != null or p.m.pocket != null) return false;
+-    const key = window_graph.Key.init(seq, seq.fed, ids.len, p.s, p.seq.scores, @intFromPtr(p.m.layers.ptr), hooks);
++    const fast_head = !hooks.prompt and ids.len <= head8.max_rows and p.m.head8 != null;
++    if (fast_head and p.m.head8.?.auditing) return false;
++    const key = window_graph.Key.init(seq, seq.fed, ids.len, p.s, p.seq.scores, @intFromPtr(p.m.layers.ptr), hooks, fast_head);
+     try window_graph.stageWindow(p, ids, seq.fed);
+     try e.graphs.window.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = p, .ids = ids, .pos0 = seq.fed });
+     seq.fed += ids.len;
+@@ -70,10 +73,12 @@ pub fn windows(e: *Engine, comptime Tri: type, tri: Tri, wins: []const Window, o
+     const media = for (wins) |w| {
+         if (w.seq.media != null) break true;
+     } else false;
+-    if (window_graph.enabled() and reads == .none and p.m.pocket == null and e.collective == null and !media) {
++    const fast_head = total <= head8.max_rows and p.m.head8 != null;
++    const audit_head = fast_head and p.m.head8.?.auditing;
++    if (window_graph.enabled() and reads == .none and p.m.pocket == null and e.collective == null and !media and !audit_head) {
+         // on one GPU: staged, then the pass as a graph keyed by every lane's buffers
+         const attn = @import("cuda_batch_lanes.zig").useAttn(&p, ids.len);
+-        const key = window_graph.SharedKey.init(lanes, s, scores, @intFromPtr(p.m.layers.ptr), out, attn);
++        const key = window_graph.SharedKey.init(lanes, s, scores, @intFromPtr(p.m.layers.ptr), out, attn, fast_head);
+         try window_graph.stageWindow(&p, ids, 0);
+         try e.graphs.shared.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = &p, .ids = ids, .pos0 = 0 });
+     } else try p.chunk(ids, 0, null);
+diff --git a/zig/src/families/flashnext/cuda_window_graph.zig b/zig/src/families/flashnext/cuda_window_graph.zig
+index e1ec60ac3..a1e06446d 100644
+--- a/zig/src/families/flashnext/cuda_window_graph.zig
++++ b/zig/src/families/flashnext/cuda_window_graph.zig
+@@ -109,8 +109,9 @@ pub const Key = struct {
+     shape: u64,
+     moving: u64,
+ 
+-    pub fn init(seq: anytype, pos0: usize, rows: usize, s: *const parts.Scratch, scores: u64, model: u64, hooks: parts.Hooks) Key {
++    pub fn init(seq: anytype, pos0: usize, rows: usize, s: *const parts.Scratch, scores: u64, model: u64, hooks: parts.Hooks, fast_head: bool) Key {
+         var h: Hash = .{};
++        h.fixed(@intFromBool(fast_head));
+         h.geometry(.at(pos0 + rows, seq.cap));
+         h.values(&[_]u64{ seq.gen, seq.cap, pieces(seq), s.h, s.cap, scores, model, hooks.logits_out, hooks.streams });
+         h.keep(hooks.keep);
+@@ -143,8 +144,9 @@ pub const SharedKey = struct {
+     shape: u64,
+     moving: u64,
+ 
+-    pub fn init(lanes: []const parts.Lane, s: *const parts.Scratch, scores: u64, model: u64, out: u64, attn: bool) SharedKey {
++    pub fn init(lanes: []const parts.Lane, s: *const parts.Scratch, scores: u64, model: u64, out: u64, attn: bool, fast_head: bool) SharedKey {
+         var h: Hash = .{};
++        h.fixed(@intFromBool(fast_head));
+         var rows: usize = 0;
+         for (lanes) |l| {
+             h.fixed(l.rows);
